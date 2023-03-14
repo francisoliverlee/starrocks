@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.statistics;
 
@@ -57,5 +70,44 @@ public class PredicateStatisticsCalculatorTest {
         Statistics estimatedStatistics =
                 PredicateStatisticsCalculator.statisticsCalculate(compoundPredicateOperator, statistics);
         Assert.assertEquals(58.0270, estimatedStatistics.getOutputRowCount(), 0.001);
+    }
+
+    @Test
+    public void testColumnEqualToColumn() {
+        ColumnRefOperator c1 = new ColumnRefOperator(0, Type.INT, "c1", true);
+        ColumnRefOperator c2 = new ColumnRefOperator(1, Type.INT, "c2", true);
+
+        Statistics statistics = Statistics.builder()
+                .addColumnStatistic(c1,
+                        ColumnStatistic.builder().setNullsFraction(0.5).setDistinctValuesCount(10).build())
+                .addColumnStatistic(c2,
+                        ColumnStatistic.builder().setNullsFraction(0.8).setDistinctValuesCount(80).build())
+                .setOutputRowCount(10000).build();
+
+        BinaryPredicateOperator binaryPredicateOperator =
+                new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, c1, c2);
+        Statistics estimatedStatistics =
+                PredicateStatisticsCalculator.statisticsCalculate(binaryPredicateOperator, statistics);
+
+        Assert.assertEquals(12.49, estimatedStatistics.getOutputRowCount(), 0.1);
+        Assert.assertEquals(10, estimatedStatistics.getColumnStatistic(c1).getDistinctValuesCount(), 0.001);
+        Assert.assertEquals(0, estimatedStatistics.getColumnStatistic(c1).getNullsFraction(), 0.001);
+        Assert.assertEquals(10, estimatedStatistics.getColumnStatistic(c2).getDistinctValuesCount(), 0.001);
+        Assert.assertEquals(0, estimatedStatistics.getColumnStatistic(c2).getNullsFraction(), 0.001);
+    }
+
+    @Test
+    public void testNullEqStatistic() throws Exception {
+        ColumnRefOperator c1 = new ColumnRefOperator(0, Type.INT, "c1", true);
+        Statistics statistics = Statistics.builder()
+                .addColumnStatistic(c1, ColumnStatistic.builder().setNullsFraction(0.5).setDistinctValuesCount(10).build())
+                .setOutputRowCount(10000).build();
+
+        BinaryPredicateOperator binaryPredicateOperator = new BinaryPredicateOperator(
+                BinaryPredicateOperator.BinaryType.EQ_FOR_NULL, c1, ConstantOperator.createNull(Type.INT));
+        Statistics estimatedStatistics =
+                PredicateStatisticsCalculator.statisticsCalculate(binaryPredicateOperator, statistics);
+        Assert.assertEquals(5000, estimatedStatistics.getOutputRowCount(), 0.001);
+        Assert.assertEquals(1, estimatedStatistics.getColumnStatistic(c1).getNullsFraction(), 0.001);
     }
 }

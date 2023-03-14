@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -7,20 +19,26 @@
 #include "column/nullable_column.h"
 #include "exprs/expr.h"
 #include "exprs/expr_context.h"
-#include "exprs/vectorized/function_helper.h"
+#include "exprs/function_helper.h"
+#include "exprs/table_function/table_function.h"
+#include "runtime/runtime_state.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 /**
  * UNNEST can be used to expand an ARRAY into a relation, arrays are expanded into a single column.
  */
 class Unnest final : public TableFunction {
+public:
     std::pair<Columns, ColumnPtr> process(TableFunctionState* state, bool* eos) const override {
         *eos = true;
+        if (state->get_columns().empty()) {
+            return {};
+        }
         Column* arg0 = state->get_columns()[0].get();
         auto* col_array = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(arg0));
         Columns result;
         if (arg0->has_null()) {
-            NullableColumn* nullable_array_column = down_cast<NullableColumn*>(arg0);
+            auto* nullable_array_column = down_cast<NullableColumn*>(arg0);
 
             auto offset_column = col_array->offsets_column();
             ColumnPtr compacted_offset_column = offset_column->clone_empty();
@@ -60,17 +78,19 @@ class Unnest final : public TableFunction {
          */
     };
 
-    Status init(TableFunctionState** state) const override {
+    Status init(const TFunction& fn, TableFunctionState** state) const override {
         *state = new UnnestState();
         return Status::OK();
     }
 
     Status prepare(TableFunctionState* state) const override { return Status::OK(); }
 
-    Status close(TableFunctionState* state) const override {
+    Status open(RuntimeState* runtime_state, TableFunctionState* state) const override { return Status::OK(); };
+
+    Status close(RuntimeState* runtime_state, TableFunctionState* state) const override {
         delete state;
         return Status::OK();
     }
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

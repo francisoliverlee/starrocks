@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/load/loadv2/LoadManagerTest.java
 
@@ -21,13 +34,13 @@
 
 package com.starrocks.load.loadv2;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.meta.MetaContext;
+import com.starrocks.server.GlobalStateMgr;
 import mockit.Expectations;
 import mockit.Injectable;
 import mockit.Mocked;
@@ -62,12 +75,12 @@ public class LoadManagerTest {
     }
 
     @Test
-    public void testSerializationNormal(@Mocked Catalog catalog,
+    public void testSerializationNormal(@Mocked GlobalStateMgr globalStateMgr,
                                         @Injectable Database database,
                                         @Injectable Table table) throws Exception {
         new Expectations() {
             {
-                catalog.getDb(anyLong);
+                globalStateMgr.getDb(anyLong);
                 minTimes = 0;
                 result = database;
                 database.getTable(anyLong);
@@ -76,7 +89,7 @@ public class LoadManagerTest {
                 table.getName();
                 minTimes = 0;
                 result = "tablename";
-                Catalog.getCurrentCatalogJournalVersion();
+                GlobalStateMgr.getCurrentStateJournalVersion();
                 minTimes = 0;
                 result = FeMetaVersion.VERSION_56;
             }
@@ -97,12 +110,12 @@ public class LoadManagerTest {
 
     @Test
     public void testSerializationWithJobRemoved(@Mocked MetaContext metaContext,
-                                                @Mocked Catalog catalog,
+                                                @Mocked GlobalStateMgr globalStateMgr,
                                                 @Injectable Database database,
                                                 @Injectable Table table) throws Exception {
         new Expectations() {
             {
-                catalog.getDb(anyLong);
+                globalStateMgr.getDb(anyLong);
                 minTimes = 0;
                 result = database;
                 database.getTable(anyLong);
@@ -130,6 +143,50 @@ public class LoadManagerTest {
         Assert.assertEquals(0, newLoadJobs.size());
     }
 
+    @Test
+    public void testDeserializationWithJobRemoved(@Mocked MetaContext metaContext,
+                                                @Mocked GlobalStateMgr globalStateMgr,
+                                                @Injectable Database database,
+                                                @Injectable Table table) throws Exception {
+        new Expectations() {
+            {
+                globalStateMgr.getDb(anyLong);
+                minTimes = 0;
+                result = database;
+                database.getTable(anyLong);
+                minTimes = 0;
+                result = table;
+                table.getName();
+                minTimes = 0;
+                result = "tablename";
+                GlobalStateMgr.getCurrentStateJournalVersion();
+                minTimes = 0;
+                result = FeMetaVersion.VERSION_CURRENT;
+            }
+        };
+
+        Config.label_keep_max_second = 10;
+
+        // 1. serialize 1 job to file
+        loadManager = new LoadManager(new LoadJobScheduler());
+        LoadJob job1 = new InsertLoadJob("job1", 1L, 1L, System.currentTimeMillis(), "", "");
+        Deencapsulation.invoke(loadManager, "addLoadJob", job1);
+        File file = serializeToFile(loadManager);
+
+        // 2. read it directly, expect 1 job
+        LoadManager newLoadManager = deserializeFromFile(file);
+        Map<Long, LoadJob> newLoadJobs = Deencapsulation.getField(newLoadManager, fieldName);
+        Assert.assertEquals(1, newLoadJobs.size());
+
+        // 3. set max keep second to 1, then read it again
+        // the job expired, expect read 0 job
+        Config.label_keep_max_second = 1;
+        Thread.sleep(2000);
+        newLoadManager = deserializeFromFile(file);
+        newLoadJobs = Deencapsulation.getField(newLoadManager, fieldName);
+        Assert.assertEquals(0, newLoadJobs.size());
+    }
+
     private File serializeToFile(LoadManager loadManager) throws Exception {
         File file = new File("./loadManagerTest");
         file.createNewFile();
@@ -148,11 +205,11 @@ public class LoadManagerTest {
     }
 
     @Test
-    public void testRemoveOldLoadJob(@Mocked Catalog catalog,
+    public void testRemoveOldLoadJob(@Mocked GlobalStateMgr globalStateMgr,
                                      @Injectable Database db) throws Exception {
         new Expectations() {
             {
-                catalog.getDb(anyLong);
+                globalStateMgr.getDb(anyLong);
                 result = db;
             }
         };
@@ -173,18 +230,18 @@ public class LoadManagerTest {
 
         // broker load job
         // loading
-        LoadJob job1 = new BrokerLoadJob(1L, "job1", null, null);
+        LoadJob job1 = new BrokerLoadJob(1L, "job1", null, null, null);
         job1.state = JobState.LOADING;
         job1.id = 11;
         Deencapsulation.invoke(loadManager, "addLoadJob", job1);
         // cancelled
-        LoadJob job2 = new BrokerLoadJob(1L, "job2", null, null);
+        LoadJob job2 = new BrokerLoadJob(1L, "job2", null, null, null);
         job2.finishTimestamp = currentTimeMs - 3000;
         job2.state = JobState.CANCELLED;
         job2.id = 16;
         Deencapsulation.invoke(loadManager, "addLoadJob", job2);
         // finished
-        LoadJob job22 = new BrokerLoadJob(1L, "job2", null, null);
+        LoadJob job22 = new BrokerLoadJob(1L, "job2", null, null, null);
         job22.finishTimestamp = currentTimeMs - 1000;
         job22.state = JobState.FINISHED;
         job22.id = 12;

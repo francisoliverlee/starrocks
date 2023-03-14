@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/Descriptors.thrift
 
@@ -56,6 +69,34 @@ enum THdfsFileFormat {
   ORC,
 }
 
+
+// Text file desc
+struct TTextFileDesc {
+    // property 'field.delim'
+    1: optional string  field_delim
+
+    // property 'line.delim'
+    2: optional string line_delim
+
+    // property 'collection.delim' 
+    3: optional string collection_delim
+
+    // property 'mapkey.delim'
+    4: optional string mapkey_delim
+
+    // compression type.
+    5: optional Types.TCompressionType compression_type;
+
+    // specifies whether to remove white space from fields
+    6: optional bool trim_space
+
+    // enclose character
+    7: optional i8 enclose
+    
+    // escape character
+    8: optional i8 escape
+}
+
 enum TSchemaTableType {
     SCH_AUTHORS= 0,
     SCH_CHARSETS,
@@ -70,6 +111,7 @@ enum TSchemaTableType {
     SCH_GLOBAL_STATUS,
     SCH_GLOBAL_VARIABLES,
     SCH_KEY_COLUMN_USAGE,
+    SCH_MATERIALIZED_VIEWS,
     SCH_OPEN_TABLES,
     SCH_PARTITIONS,
     SCH_PLUGINS,
@@ -84,6 +126,7 @@ enum TSchemaTableType {
     SCH_STATISTICS,
     SCH_STATUS,
     SCH_TABLES,
+    SCH_TABLES_CONFIG,
     SCH_TABLE_CONSTRAINTS,
     SCH_TABLE_NAMES,
     SCH_TABLE_PRIVILEGES,
@@ -91,7 +134,13 @@ enum TSchemaTableType {
     SCH_USER_PRIVILEGES,
     SCH_VARIABLES,
     SCH_VIEWS,
-    SCH_INVALID
+    SCH_TASKS,
+    SCH_TASK_RUNS,
+    SCH_VERBOSE_SESSION_VARIABLES,
+    SCH_BE_TABLETS,
+    SCH_BE_METRICS,
+    SCH_BE_TXNS,
+    SCH_BE_CONFIGS
 }
 
 enum THdfsCompression {
@@ -129,7 +178,8 @@ struct TColumn {
     5: optional bool is_allow_null                                                                    
     6: optional string default_value               
     7: optional bool is_bloom_filter_column     
-    8: optional Exprs.TExpr define_expr                                                               
+    8: optional Exprs.TExpr define_expr 
+    9: optional bool is_auto_increment                                                              
                                                                                                       
     // How many bytes used for short key index encoding.
     // For fixed-length column, this value may be ignored by BE when creating a tablet.
@@ -157,6 +207,10 @@ struct TOlapTablePartition {
 
     6: optional list<Exprs.TExprNode> start_keys
     7: optional list<Exprs.TExprNode> end_keys
+
+    8: optional list<list<Exprs.TExprNode>> in_keys
+    // for automatic partition
+    9: optional bool is_shadow_partition = false
 }
 
 struct TOlapTablePartitionParam {
@@ -175,6 +229,9 @@ struct TOlapTablePartitionParam {
     6: required list<TOlapTablePartition> partitions
 
     7: optional list<string> partition_columns
+    8: optional list<Exprs.TExpr> partition_exprs
+
+    9: optional bool enable_automatic_partition
 }
 
 struct TOlapTableIndexSchema {
@@ -287,6 +344,106 @@ struct THdfsTable {
     5: optional list<string> partition_prefixes
 }
 
+struct TFileTable {
+    // File table base dir
+    1: optional string location
+
+    // Schema columns
+    2: optional list<TColumn> columns
+}
+
+struct TIcebergSchema {
+    1: optional list<TIcebergSchemaField> fields
+}
+
+struct TIcebergSchemaField {
+    // Refer to field id in iceberg schema
+    1: optional i32 field_id
+
+    // Refer to field name
+    2: optional string name
+
+    // You can fill other field properties here if you needed
+    // .......
+
+    // Children fields for struct, map and list(array)
+    100: optional list<TIcebergSchemaField> children
+}
+
+struct TIcebergTable {
+    // table location
+    1: optional string location
+
+    // Schema columns, except partition columns
+    2: optional list<TColumn> columns
+
+    // Iceberg schema, used to support schema evolution
+    3: optional TIcebergSchema iceberg_schema
+}
+
+struct THudiTable {
+    // table location
+    1: optional string location
+
+    // Schema columns, except partition columns
+    2: optional list<TColumn> columns
+
+    // Partition columns
+    3: optional list<TColumn> partition_columns
+
+    // Map from partition id to partition metadata.
+    4: optional map<i64, THdfsPartition> partitions
+
+    // The prefixes of locations of partitions in this table
+    5: optional list<string> partition_prefixes
+
+    // hudi table instant time
+    6: optional string instant_time
+
+    // hudi table hive_column_names
+    7: optional string hive_column_names
+
+    // hudi table hive_column_types
+    8: optional string hive_column_types
+
+    // hudi table input_format
+    9: optional string input_format
+
+    // hudi table serde_lib
+    10: optional string serde_lib
+
+    // hudi table type: copy on write or merge on read
+    11: optional bool is_mor_table
+}
+
+struct TDeltaLakeTable {
+    // table location
+    1: optional string location
+
+    // Schema columns, except partition columns
+    2: optional list<TColumn> columns
+
+    // Partition columns
+    3: optional list<TColumn> partition_columns
+
+    // Map from partition id to partition metadata.
+    4: optional map<i64, THdfsPartition> partitions
+
+    // The prefixes of locations of partitions in this table
+    5: optional list<string> partition_prefixes
+}
+
+struct TJDBCTable {
+    1: optional string jdbc_driver_name
+    2: optional string jdbc_driver_url
+    3: optional string jdbc_driver_checksum
+    4: optional string jdbc_driver_class
+    5: optional string jdbc_url
+    6: optional string jdbc_table
+    7: optional string jdbc_user
+    8: optional string jdbc_passwd
+}
+
 // "Union" of all table types.
 struct TTableDescriptor {
   1: required Types.TTableId id
@@ -304,9 +461,22 @@ struct TTableDescriptor {
   12: optional TSchemaTable schemaTable
   14: optional TBrokerTable BrokerTable
   15: optional TEsTable esTable
+  16: optional TJDBCTable jdbcTable
 
   // Hdfs Table schema
   30: optional THdfsTable hdfsTable
+
+  // Iceberg Table schema
+  31: optional TIcebergTable icebergTable
+
+  // Hudi Table schema
+  32: optional THudiTable hudiTable
+
+  // Delta Lake schema
+  33: optional TDeltaLakeTable deltaLakeTable
+
+  // File Table
+  34: optional TFileTable fileTable
 }
 
 struct TDescriptorTable {
@@ -315,4 +485,32 @@ struct TDescriptorTable {
 
   // all table descriptors referenced by tupleDescriptors
   3: optional list<TTableDescriptor> tableDescriptors;
+  4: optional bool is_cached;
+}
+
+// Describe route info of a Olap Table
+struct TOlapTableRouteInfo {
+  1: optional TOlapTableSchemaParam schema
+  2: optional TOlapTablePartitionParam partition
+  3: optional TOlapTableLocationParam location
+  5: optional i32 num_replicas
+  6: optional string db_name
+  7: optional string table_name
+  8: optional TNodesInfo nodes_info
+  9: optional Types.TKeysType keys_type
+}
+
+enum TIMTType {
+  OLAP_TABLE,
+  ROWSTORE_TABLE, // Not implemented
+}
+
+struct TIMTDescriptor {
+  1: optional TIMTType imt_type
+  2: optional TOlapTableRouteInfo olap_table
+  3: optional bool need_maintain // Not implemented
+
+  // For maintained IMT, some extra information are necessary
+  11: optional Types.TUniqueId load_id
+  12: optional i64 txn_id
 }

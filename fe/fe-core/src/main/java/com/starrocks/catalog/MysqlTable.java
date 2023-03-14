@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/MysqlTable.java
 
@@ -27,6 +40,7 @@ import com.starrocks.analysis.DescriptorTable.ReferencedPartitionInfo;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TMySQLTable;
 import com.starrocks.thrift.TTableDescriptor;
 import com.starrocks.thrift.TTableType;
@@ -36,7 +50,7 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.zip.Adler32;
@@ -127,7 +141,7 @@ public class MysqlTable extends Table {
 
     private String getPropertyFromResource(String propertyName) {
         OdbcCatalogResource odbcCatalogResource = (OdbcCatalogResource)
-                (Catalog.getCurrentCatalog().getResourceMgr().getResource(odbcCatalogResourceName));
+                (GlobalStateMgr.getCurrentState().getResourceMgr().getResource(odbcCatalogResourceName));
         if (odbcCatalogResource == null) {
             throw new RuntimeException("Resource does not exist. name: " + odbcCatalogResourceName);
         }
@@ -190,30 +204,22 @@ public class MysqlTable extends Table {
     public int getSignature(int signatureVersion) {
         Adler32 adler32 = new Adler32();
         adler32.update(signatureVersion);
-        String charsetName = "UTF-8";
-
-        try {
-            // name
-            adler32.update(name.getBytes(charsetName));
-            // type
-            adler32.update(type.name().getBytes(charsetName));
-            // host
-            adler32.update(getHost().getBytes(charsetName));
-            // port
-            adler32.update(getPort().getBytes(charsetName));
-            // username
-            adler32.update(getUserName().getBytes(charsetName));
-            // passwd
-            adler32.update(getPasswd().getBytes(charsetName));
-            // mysql db
-            adler32.update(mysqlDatabaseName.getBytes(charsetName));
-            // mysql table
-            adler32.update(mysqlTableName.getBytes(charsetName));
-
-        } catch (UnsupportedEncodingException e) {
-            LOG.error("encoding error", e);
-            return -1;
-        }
+        // name
+        adler32.update(name.getBytes(StandardCharsets.UTF_8));
+        // type
+        adler32.update(type.name().getBytes(StandardCharsets.UTF_8));
+        // host
+        adler32.update(getHost().getBytes(StandardCharsets.UTF_8));
+        // port
+        adler32.update(getPort().getBytes(StandardCharsets.UTF_8));
+        // username
+        adler32.update(getUserName().getBytes(StandardCharsets.UTF_8));
+        // passwd
+        adler32.update(getPasswd().getBytes(StandardCharsets.UTF_8));
+        // mysql db
+        adler32.update(mysqlDatabaseName.getBytes(StandardCharsets.UTF_8));
+        // mysql table
+        adler32.update(mysqlTableName.getBytes(StandardCharsets.UTF_8));
 
         return Math.abs((int) adler32.getValue());
     }
@@ -244,7 +250,7 @@ public class MysqlTable extends Table {
     public void readFields(DataInput in) throws IOException {
         super.readFields(in);
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_92) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_92) {
             // Read MySQL meta
             int size = in.readInt();
             Map<String, String> serializeMap = Maps.newHashMap();
@@ -269,5 +275,10 @@ public class MysqlTable extends Table {
             mysqlDatabaseName = Text.readString(in);
             mysqlTableName = Text.readString(in);
         }
+    }
+
+    @Override
+    public boolean isSupported() {
+        return true;
     }
 }

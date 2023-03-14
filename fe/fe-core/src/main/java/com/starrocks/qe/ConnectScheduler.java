@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/ConnectScheduler.java
 
@@ -23,12 +36,14 @@ package com.starrocks.qe;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.Config;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.mysql.MysqlProto;
 import com.starrocks.mysql.nio.NConnectContext;
 import com.starrocks.mysql.privilege.PrivPredicate;
+import com.starrocks.privilege.PrivilegeActions;
+import com.starrocks.privilege.PrivilegeType;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -43,26 +58,25 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class ConnectScheduler {
     private static final Logger LOG = LogManager.getLogger(ConnectScheduler.class);
-    private int maxConnections;
-    private int numberConnection;
-    private AtomicInteger nextConnectionId;
+    private final AtomicInteger maxConnections;
+    private final AtomicInteger numberConnection;
+    private final AtomicInteger nextConnectionId;
 
-    private Map<Long, ConnectContext> connectionMap = Maps.newHashMap();
-    private Map<String, AtomicInteger> connByUser = Maps.newHashMap();
-    private ExecutorService executor = ThreadPoolManager
+    private final Map<Long, ConnectContext> connectionMap = Maps.newConcurrentMap();
+    private final Map<String, AtomicInteger> connByUser = Maps.newConcurrentMap();
+    private final ExecutorService executor = ThreadPoolManager
             .newDaemonCacheThreadPool(Config.max_connection_scheduler_threads_num, "connect-scheduler-pool", true);
 
-    // Use a thread to check whether connection is timeout. Because
-    // 1. If use a scheduler, the task maybe a huge number when query is messy.
-    //    Let timeout is 10m, and 5000 qps, then there are up to 3000000 tasks in scheduler.
-    // 2. Use a thread to poll maybe lose some accurate, but is enough to us.
-    private ScheduledExecutorService checkTimer = ThreadPoolManager.newDaemonScheduledThreadPool(1,
-            "Connect-Scheduler-Check-Timer", true);
-
     public ConnectScheduler(int maxConnections) {
-        this.maxConnections = maxConnections;
-        numberConnection = 0;
+        this.maxConnections = new AtomicInteger(maxConnections);
+        numberConnection = new AtomicInteger(0);
         nextConnectionId = new AtomicInteger(0);
+        // Use a thread to check whether connection is timeout. Because
+        // 1. If use a scheduler, the task maybe a huge number when query is messy.
+        //    Let timeout is 10m, and 5000 qps, then there are up to 3000000 tasks in scheduler.
+        // 2. Use a thread to poll maybe lose some accurate, but is enough to us.
+        ScheduledExecutorService checkTimer = ThreadPoolManager.newDaemonScheduledThreadPool(1,
+                "Connect-Scheduler-Check-Timer", true);
         checkTimer.scheduleAtFixedRate(new TimeoutChecker(), 0, 1000L, TimeUnit.MILLISECONDS);
     }
 
@@ -98,6 +112,7 @@ public class ConnectScheduler {
         }
 
         context.setConnectionId(nextConnectionId.getAndAdd(1));
+        context.resetConnectionStartTime();
         // no necessary for nio.
         if (context instanceof NConnectContext) {
             return true;
@@ -110,8 +125,8 @@ public class ConnectScheduler {
     }
 
     // Register one connection with its connection id.
-    public synchronized boolean registerConnection(ConnectContext ctx) {
-        if (numberConnection >= maxConnections) {
+    public boolean registerConnection(ConnectContext ctx) {
+        if (numberConnection.get() >= maxConnections.get()) {
             return false;
         }
         // Check user
@@ -119,18 +134,24 @@ public class ConnectScheduler {
             connByUser.put(ctx.getQualifiedUser(), new AtomicInteger(0));
         }
         int conns = connByUser.get(ctx.getQualifiedUser()).get();
-        if (conns >= ctx.getCatalog().getAuth().getMaxConn(ctx.getQualifiedUser())) {
+        long currentConns;
+        if (ctx.getGlobalStateMgr().isUsingNewPrivilege()) {
+            currentConns = ctx.getGlobalStateMgr().getAuthenticationManager().getMaxConn(ctx.getQualifiedUser());
+        } else {
+            currentConns = ctx.getGlobalStateMgr().getAuth().getMaxConn(ctx.getQualifiedUser());
+        }
+        if (conns >= currentConns) {
             return false;
         }
-        numberConnection++;
+        numberConnection.incrementAndGet();
         connByUser.get(ctx.getQualifiedUser()).incrementAndGet();
         connectionMap.put((long) ctx.getConnectionId(), ctx);
         return true;
     }
 
-    public synchronized void unregisterConnection(ConnectContext ctx) {
+    public void unregisterConnection(ConnectContext ctx) {
         if (connectionMap.remove((long) ctx.getConnectionId()) != null) {
-            numberConnection--;
+            numberConnection.decrementAndGet();
             AtomicInteger conns = connByUser.get(ctx.getQualifiedUser());
             if (conns != null) {
                 conns.decrementAndGet();
@@ -138,28 +159,44 @@ public class ConnectScheduler {
         }
     }
 
-    public synchronized ConnectContext getContext(long connectionId) {
+    public ConnectContext getContext(long connectionId) {
         return connectionMap.get(connectionId);
     }
 
-    public synchronized int getConnectionNum() {
-        return numberConnection;
+    public int getConnectionNum() {
+        return numberConnection.get();
     }
 
-    public synchronized List<ConnectContext.ThreadInfo> listConnection(String user) {
+    private List<ConnectContext.ThreadInfo> getAllConnThreadInfoByUser(ConnectContext connectContext, String user) {
         List<ConnectContext.ThreadInfo> infos = Lists.newArrayList();
+        ConnectContext currContext = connectContext == null ? ConnectContext.get() : connectContext;
 
         for (ConnectContext ctx : connectionMap.values()) {
-            // Check auth
-            if (!ctx.getQualifiedUser().equals(user) &&
-                    !Catalog.getCurrentCatalog().getAuth().checkGlobalPriv(ConnectContext.get(),
-                            PrivPredicate.GRANT)) {
-                continue;
+            if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
+                if (!ctx.getQualifiedUser().equals(user) &&
+                        !PrivilegeActions.checkSystemAction(currContext, PrivilegeType.OPERATE)) {
+                    continue;
+                }
+            } else {
+                // Check auth
+                if (!ctx.getQualifiedUser().equals(user) &&
+                        !GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(currContext,
+                                PrivPredicate.GRANT)) {
+                    continue;
+                }
             }
 
             infos.add(ctx.toThreadInfo());
         }
         return infos;
+    }
+
+    public List<ConnectContext.ThreadInfo> listConnection(String user) {
+        return getAllConnThreadInfoByUser(null, user);
+    }
+
+    public List<ConnectContext.ThreadInfo> listConnection(ConnectContext context, String user) {
+        return getAllConnThreadInfoByUser(context, user);
     }
 
     private class LoopHandler implements Runnable {
@@ -192,7 +229,7 @@ public class ConnectScheduler {
                 ConnectProcessor processor = new ConnectProcessor(context);
                 processor.loop();
             } catch (Exception e) {
-                // for unauthrorized access such lvs probe request, may cause exception, just log it in debug level
+                // for unauthorized access such lvs probe request, may cause exception, just log it in debug level
                 if (context.getCurrentUserIdentity() != null) {
                     LOG.warn("connect processor exception because ", e);
                 } else {

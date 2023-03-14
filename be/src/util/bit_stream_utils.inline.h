@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/bit_stream_utils.inline.h
 
@@ -18,8 +31,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef IMPALA_UTIL_BIT_STREAM_UTILS_INLINE_H
-#define IMPALA_UTIL_BIT_STREAM_UTILS_INLINE_H
+#pragma once
 
 #include <algorithm>
 
@@ -86,16 +98,17 @@ inline void BitWriter::PutAligned(T val, int num_bytes) {
     memcpy(ptr, &val, num_bytes);
 }
 
-inline void BitWriter::PutVlqInt(int32_t v) {
+inline void BitWriter::PutVlqInt(uint32_t v) {
+    [[maybe_unused]] int num_bytes = 0;
     while ((v & 0xFFFFFF80) != 0L) {
         PutAligned<uint8_t>((v & 0x7F) | 0x80, 1);
         v >>= 7;
+        DCHECK_LE(++num_bytes, MAX_VLQ_BYTE_LEN);
     }
     PutAligned<uint8_t>(v & 0x7F, 1);
 }
 
-inline BitReader::BitReader(const uint8_t* buffer, int buffer_len)
-        : buffer_(buffer), max_bytes_(buffer_len), buffered_values_(0), byte_offset_(0), bit_offset_(0) {
+inline BitReader::BitReader(const uint8_t* buffer, int buffer_len) : buffer_(buffer), max_bytes_(buffer_len) {
     int num_bytes = std::min(8, max_bytes_);
     memcpy(&buffered_values_, buffer_ + byte_offset_, num_bytes);
 }
@@ -192,10 +205,10 @@ inline bool BitReader::GetAligned(int num_bytes, T* v) {
     return true;
 }
 
-inline bool BitReader::GetVlqInt(int32_t* v) {
+inline bool BitReader::GetVlqInt(uint32_t* v) {
     *v = 0;
     int shift = 0;
-    int num_bytes = 0;
+    [[maybe_unused]] int num_bytes = 0;
     uint8_t byte = 0;
     do {
         if (!GetAligned<uint8_t>(1, &byte)) return false;
@@ -248,5 +261,3 @@ inline int BatchedBitReader::unpack_batch(int bit_width, int num_values, T* v) {
 }
 
 } // namespace starrocks
-
-#endif

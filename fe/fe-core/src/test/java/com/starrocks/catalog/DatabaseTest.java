@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/DatabaseTest.java
 
@@ -27,6 +40,7 @@ import com.starrocks.common.FeConstants;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.persist.CreateTableInfo;
 import com.starrocks.persist.EditLog;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStorageType;
 import mockit.Expectations;
 import mockit.Mocked;
@@ -50,33 +64,37 @@ public class DatabaseTest {
     private long dbId = 10000;
 
     @Mocked
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     @Mocked
     private EditLog editLog;
 
     @Before
-    public void Setup() {
+    public void setup() {
         db = new Database(dbId, "dbTest");
         new Expectations() {
             {
                 editLog.logCreateTable((CreateTableInfo) any);
                 minTimes = 0;
 
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
             }
         };
 
-        new Expectations(catalog) {
+        new Expectations(globalStateMgr) {
             {
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
 
-                Catalog.getCurrentCatalogJournalVersion();
+                GlobalStateMgr.getCurrentStateJournalVersion();
                 minTimes = 0;
-                result = FeConstants.meta_version;
+                result = FeConstants.META_VERSION;
+
+                globalStateMgr.getClusterId();
+                minTimes = 0;
+                result = 1;
             }
         };
     }
@@ -100,7 +118,7 @@ public class DatabaseTest {
 
     @Test
     public void createAndDropPartitionTest() {
-        Assert.assertEquals("dbTest", db.getFullName());
+        Assert.assertEquals("dbTest", db.getOriginName());
         Assert.assertEquals(dbId, db.getId());
 
         MaterializedIndex baseIndex = new MaterializedIndex(10001, IndexState.NORMAL);
@@ -121,8 +139,8 @@ public class DatabaseTest {
         Assert.assertEquals(1, db.getTables().size());
         Assert.assertEquals(table, db.getTables().get(0));
 
-        Assert.assertEquals(1, db.getTableNamesWithLock().size());
-        for (String tableFamilyGroupName : db.getTableNamesWithLock()) {
+        Assert.assertEquals(1, db.getTableNamesViewWithLock().size());
+        for (String tableFamilyGroupName : db.getTableNamesViewWithLock()) {
             Assert.assertEquals(table.getName(), tableFamilyGroupName);
         }
 
@@ -183,9 +201,9 @@ public class DatabaseTest {
 
         List<Column> column = Lists.newArrayList();
         column.add(column2);
-        table.setIndexMeta(new Long(1), "test", column, 1, 1, shortKeyColumnCount,
+        table.setIndexMeta(1, "test", column, 1, 1, shortKeyColumnCount,
                 TStorageType.COLUMN, KeysType.AGG_KEYS);
-        table.setIndexMeta(new Long(1), "test", column, 1, 1, shortKeyColumnCount, TStorageType.COLUMN,
+        table.setIndexMeta(1, "test", column, 1, 1, shortKeyColumnCount, TStorageType.COLUMN,
                 KeysType.AGG_KEYS);
         Deencapsulation.setField(table, "baseIndexId", 1);
         table.addPartition(partition);
@@ -209,5 +227,20 @@ public class DatabaseTest {
         // 3. delete files
         dis.close();
         file.delete();
+    }
+
+    @Test
+    public void testGetUUID() {
+        // Internal database
+        Database db1 = new Database();
+        Assert.assertEquals("0", db1.getUUID());
+
+        Database db2 = new Database(101, "db2");
+        Assert.assertEquals("101", db2.getUUID());
+
+        // External database
+        Database db3 = new Database(101, "db3");
+        db3.setCatalogName("hive");
+        Assert.assertEquals("hive.db3", db3.getUUID());
     }
 }

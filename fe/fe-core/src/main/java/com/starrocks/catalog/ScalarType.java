@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/ScalarType.java
 
@@ -31,8 +44,6 @@ import com.starrocks.thrift.TScalarType;
 import com.starrocks.thrift.TTypeDesc;
 import com.starrocks.thrift.TTypeNode;
 import com.starrocks.thrift.TTypeNodeType;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.Objects;
 
@@ -47,13 +58,14 @@ import java.util.Objects;
  * indicating that any decimal type is a subtype of the decimal type.
  */
 public class ScalarType extends Type implements Cloneable {
-    private static final Logger LOG = LogManager.getLogger(ScalarType.class);
+
     // SQL allows the engine to pick the default precision. We pick the largest
     // precision that is supported by the smallest decimal type in the BE (4 bytes).
     public static final int DEFAULT_PRECISION = 9;
     public static final int DEFAULT_SCALE = 0; // SQL standard
     // Longest supported VARCHAR and CHAR, chosen to match Hive.
-    public static final int MAX_VARCHAR_LENGTH = 65533;
+    public static final int DEFAULT_STRING_LENGTH = 65533;
+    public static final int MAX_VARCHAR_LENGTH = 1048576;
     public static final int MAX_CHAR_LENGTH = 255;
     // HLL DEFAULT LENGTH  2^14(registers) + 1(type)
     public static final int MAX_HLL_LENGTH = 16385;
@@ -79,12 +91,18 @@ public class ScalarType extends Type implements Cloneable {
         this.type = type;
     }
 
+    public ScalarType() {
+        this.type = PrimitiveType.INVALID_TYPE;
+    }
+
     public static ScalarType createType(PrimitiveType type, int len, int precision, int scale) {
         switch (type) {
             case CHAR:
                 return createCharType(len);
             case VARCHAR:
                 return createVarcharType(len);
+            case VARBINARY:
+                return createVarbinary(len);
             case DECIMALV2:
                 return createDecimalV2Type(precision, scale);
             case DECIMAL32:
@@ -97,111 +115,15 @@ public class ScalarType extends Type implements Cloneable {
     }
 
     public static ScalarType createType(PrimitiveType type) {
-        switch (type) {
-            case INVALID_TYPE:
-                return INVALID;
-            case NULL_TYPE:
-                return NULL;
-            case BOOLEAN:
-                return BOOLEAN;
-            case SMALLINT:
-                return SMALLINT;
-            case TINYINT:
-                return TINYINT;
-            case INT:
-                return INT;
-            case BIGINT:
-                return BIGINT;
-            case FLOAT:
-                return FLOAT;
-            case DOUBLE:
-                return DOUBLE;
-            case CHAR:
-                return CHAR;
-            case VARCHAR:
-                return createVarcharType();
-            case HLL:
-                return createHllType();
-            case BITMAP:
-                return BITMAP;
-            case PERCENTILE:
-                return PERCENTILE;
-            case DATE:
-                return DATE;
-            case DATETIME:
-                return DATETIME;
-            case TIME:
-                return TIME;
-            case DECIMALV2:
-                return DEFAULT_DECIMALV2;
-            case LARGEINT:
-                return LARGEINT;
-            case DECIMAL32:
-                return DECIMAL32;
-            case DECIMAL64:
-                return DECIMAL64;
-            case DECIMAL128:
-                return DECIMAL128;
-            default:
-                LOG.warn("type={}", type);
-                Preconditions.checkState(false);
-                return NULL;
-        }
+        ScalarType res = PRIMITIVE_TYPE_SCALAR_TYPE_MAP.get(type);
+        Preconditions.checkNotNull(res, "unknown type " + type);
+        return res;
     }
 
     public static ScalarType createType(String type) {
-        switch (type) {
-            case "INVALID_TYPE":
-                return INVALID;
-            case "NULL_TYPE":
-                return NULL;
-            case "BOOLEAN":
-                return BOOLEAN;
-            case "SMALLINT":
-                return SMALLINT;
-            case "TINYINT":
-                return TINYINT;
-            case "INT":
-                return INT;
-            case "BIGINT":
-                return BIGINT;
-            case "FLOAT":
-                return FLOAT;
-            case "DOUBLE":
-                return DOUBLE;
-            case "CHAR":
-                return CHAR;
-            case "VARCHAR":
-                return createVarcharType();
-            case "HLL":
-                return createHllType();
-            case "BITMAP":
-                return BITMAP;
-            case "PERCENTILE":
-                return PERCENTILE;
-            case "DATE":
-                return DATE;
-            case "DATETIME":
-                return DATETIME;
-            case "TIME":
-                return TIME;
-            case "DECIMAL":
-                return createDecimalV2Type();
-            case "DECIMALV2":
-                return createDecimalV2Type();
-            case "LARGEINT":
-                return LARGEINT;
-            case "DECIMAL32":
-                return DECIMAL32;
-            case "DECIMAL64":
-                return DECIMAL64;
-            case "DECIMAL128":
-                return DECIMAL128;
-            default:
-                LOG.warn("type={}", type);
-                Preconditions.checkState(false);
-                return NULL;
-        }
+        ScalarType res = STATIC_TYPE_MAP.get(type);
+        Preconditions.checkNotNull(res, "unknown type " + type);
+        return res;
     }
 
     public static ScalarType createCharType(int len) {
@@ -230,6 +152,9 @@ public class ScalarType extends Type implements Cloneable {
         return new AnalysisException(hint + "error='" + errorMsg + "'");
     }
 
+    /**
+     * Unified decimal is used for parser, which creating default decimal from name
+     */
     public static ScalarType createUnifiedDecimalType() throws AnalysisException {
         throw decimalParseError("both precision and scale are absent");
     }
@@ -266,22 +191,37 @@ public class ScalarType extends Type implements Cloneable {
     }
 
     public static ScalarType createDecimalV3Type(PrimitiveType type, int precision, int scale) {
-        Preconditions.checkArgument(0 < precision && precision <= PrimitiveType.getMaxPrecisionOfDecimal(type));
-        Preconditions.checkArgument(0 <= scale && scale <= precision);
+        Preconditions.checkArgument(0 <= precision && precision <= PrimitiveType.getMaxPrecisionOfDecimal(type),
+                "DECIMAL's precision should range from 1 to 38");
+        Preconditions.checkArgument(0 <= scale && scale <= precision,
+                "DECIMAL(P[,S]) type P must be greater than or equal to the value of S");
+
         ScalarType scalarType = new ScalarType(type);
-        scalarType.precision = precision;
+        scalarType.precision = Math.max(precision, 1);
         scalarType.scale = scale;
         return scalarType;
     }
 
-    // 0's type is decimal32(0,0)
-    public static ScalarType createDecimalV3TypeForZero() {
-        ScalarType scalarType = new ScalarType(PrimitiveType.DECIMAL32);
-        scalarType.precision = 0;
-        scalarType.scale = 0;
+    public static ScalarType createDecimalV3TypeForZero(int scale) {
+        final ScalarType scalarType;
+        if (scale <= PrimitiveType.getMaxPrecisionOfDecimal(PrimitiveType.DECIMAL32)) {
+            scalarType = new ScalarType(PrimitiveType.DECIMAL32);
+        } else if (scale <= PrimitiveType.getDefaultScaleOfDecimal(PrimitiveType.DECIMAL64)) {
+            scalarType = new ScalarType(PrimitiveType.DECIMAL64);
+        } else if (scale <= PrimitiveType.getDefaultScaleOfDecimal(PrimitiveType.DECIMAL128)) {
+            scalarType = new ScalarType(PrimitiveType.DECIMAL128);
+        } else {
+            scalarType = new ScalarType(PrimitiveType.DECIMAL128);
+            scale = PrimitiveType.getDefaultScaleOfDecimal(PrimitiveType.DECIMAL128);
+        }
+        scalarType.precision = scale;
+        scalarType.scale = scale;
         return scalarType;
     }
 
+    /**
+     * Wildcard decimal is used for function matching
+     */
     public static ScalarType createWildcardDecimalV3Type(PrimitiveType type) {
         Preconditions.checkArgument(type.isDecimalV3Type());
         ScalarType scalarType = new ScalarType(type);
@@ -303,7 +243,7 @@ public class ScalarType extends Type implements Cloneable {
 
     public static ScalarType createDecimalV3NarrowestType(int precision, int scale) {
         if (precision == 0 && scale == 0) {
-            return createDecimalV3TypeForZero();
+            return createDecimalV3TypeForZero(0);
         }
         final int decimal32MaxPrecision = PrimitiveType.getMaxPrecisionOfDecimal(PrimitiveType.DECIMAL32);
         final int decimal64MaxPrecision = PrimitiveType.getMaxPrecisionOfDecimal(PrimitiveType.DECIMAL64);
@@ -316,9 +256,22 @@ public class ScalarType extends Type implements Cloneable {
             return createDecimalV3Type(PrimitiveType.DECIMAL128, precision, scale);
         } else {
             Preconditions.checkState(false,
-                    "Illegal decimal precision(1 to 38): pecision=" + precision);
+                    "Illegal decimal precision(1 to 38): precision=" + precision);
             return ScalarType.INVALID;
         }
+    }
+
+    public static ScalarType createDefaultString() {
+        ScalarType stringType = ScalarType.createVarcharType(ScalarType.DEFAULT_STRING_LENGTH);
+        stringType.setAssignedStrLenInColDefinition();
+        return stringType;
+    }
+
+    // Use for Hive string now.
+    public static ScalarType createDefaultExternalTableString() {
+        ScalarType stringType = ScalarType.createVarcharType(ScalarType.MAX_VARCHAR_LENGTH);
+        stringType.setAssignedStrLenInColDefinition();
+        return stringType;
     }
 
     public static ScalarType createVarcharType(int len) {
@@ -335,6 +288,12 @@ public class ScalarType extends Type implements Cloneable {
         return type;
     }
 
+    public static ScalarType createVarbinary(int len) {
+        ScalarType type = new ScalarType(PrimitiveType.VARBINARY);
+        type.len = len;
+        return type;
+    }
+
     public static ScalarType createVarcharType() {
         return Type.VARCHAR;
     }
@@ -343,6 +302,10 @@ public class ScalarType extends Type implements Cloneable {
         ScalarType type = new ScalarType(PrimitiveType.HLL);
         type.len = MAX_HLL_LENGTH;
         return type;
+    }
+
+    public static ScalarType createUnknownType() {
+        return new ScalarType(PrimitiveType.UNKNOWN_TYPE);
     }
 
     // A common type for two decimal v3 types means that if t2 = getCommonTypeForDecimalV3(t0, t1),
@@ -365,7 +328,17 @@ public class ScalarType extends Type implements Cloneable {
         if (precision > 38) {
             return ScalarType.DOUBLE;
         } else {
-            return ScalarType.createDecimalV3NarrowestType(precision, scale);
+            // the common type's PrimitiveType of two decimal types should wide enough, i.e
+            // the common type of (DECIMAL32, DECIMAL64) should be DECIMAL64
+            PrimitiveType primitiveType =
+                    PrimitiveType.getWiderDecimalV3Type(lhs.getPrimitiveType(), rhs.getPrimitiveType());
+            // the narrowestType for specified precision and scale is just wide properly to hold a decimal value, i.e
+            // DECIMAL128(7,4), DECIMAL64(7,4) and DECIMAL32(7,4) can all be held in a DECIMAL32(7,4) type without
+            // precision loss.
+            Type narrowestType = ScalarType.createDecimalV3NarrowestType(precision, scale);
+            primitiveType = PrimitiveType.getWiderDecimalV3Type(primitiveType, narrowestType.getPrimitiveType());
+            // create a commonType with wider primitive type.
+            return ScalarType.createDecimalV3Type(primitiveType, precision, scale);
         }
     }
 
@@ -415,6 +388,8 @@ public class ScalarType extends Type implements Cloneable {
             case VARCHAR:
             case DATE:
             case DATETIME:
+            case TIME:
+            case JSON:
                 return DOUBLE;
             default:
                 return INVALID;
@@ -427,10 +402,12 @@ public class ScalarType extends Type implements Cloneable {
      * Returns INVALID_TYPE if there is no such type or if any of t1 and t2
      * is INVALID_TYPE.
      */
-    public static ScalarType getAssignmentCompatibleType(
-            ScalarType t1, ScalarType t2, boolean strict) {
+    public static ScalarType getAssignmentCompatibleType(ScalarType t1, ScalarType t2, boolean strict) {
         if (!t1.isValid() || !t2.isValid()) {
             return INVALID;
+        }
+        if (t1.isUnknown() || t2.isUnknown()) {
+            return UNKNOWN_TYPE;
         }
         if (t1.equals(t2)) {
             return t1;
@@ -471,24 +448,78 @@ public class ScalarType extends Type implements Cloneable {
             return DECIMALV2;
         }
 
+        if (t1.isFunctionType() || t2.isFunctionType()) {
+            return INVALID;
+        }
+
         PrimitiveType smallerType =
                 (t1.type.ordinal() < t2.type.ordinal() ? t1.type : t2.type);
         PrimitiveType largerType =
                 (t1.type.ordinal() > t2.type.ordinal() ? t1.type : t2.type);
         PrimitiveType result = compatibilityMatrix[smallerType.ordinal()][largerType.ordinal()];
-        Preconditions.checkNotNull(result);
+        Preconditions.checkNotNull(result, String.format("No assignment from %s to %s", t1, t2));
         return createType(result);
+    }
+
+    /**
+     * Returns true if t2 can be fully compatible with t1.
+     * fully compatible means that all possible values of t1 can be represented by t2,
+     * and no null values will be produced if we cast t1 as t2.
+     * This is closely related to the implementation by BE.
+     * @TODO: the currently implementation is conservative, we can add more rules later.
+     */
+    public static boolean isFullyCompatible(Type t1, Type t2) {
+        if (t1.isScalarType() && t2.isScalarType()) {
+            return isFullyCompatible((ScalarType) t1, (ScalarType) t2);
+        }
+        if (t1.isArrayType() && t2.isArrayType()) {
+            return isFullyCompatible(((ArrayType) t1).getItemType(), ((ArrayType) t2).getItemType());
+        }
+        return false;
+    }
+
+    public static boolean isFullyCompatible(ScalarType t1, ScalarType t2) {
+        // same type
+        if (t1.equals(t2)) {
+            return true;
+        }
+        if (t1.isBoolean()) {
+            return t2.isIntegerType() || t2.isLargeIntType() || t2.isStringType() || t2.isNumericType();
+        }
+        if (t1.isIntegerType() || t1.isLargeIntType()) {
+            if (t2.isIntegerType() || t2.isLargeIntType()) {
+                return t1.ordinal() < t2.ordinal();
+            }
+            if (t2.isStringType()) {
+                return true;
+            }
+            return false;
+        }
+        if (t1.isDecimalV3()) {
+            if (t2.isDecimalV3()) {
+                return t2.precision >= t1.precision && t2.scale >= t1.scale;
+            }
+            if (t2.isStringType() || t2.isFloatingPointType()) {
+                return true;
+            }
+            return false;
+        }
+        // both string
+        if (t1.isStringType() && t2.isStringType()) {
+            return true;
+        }
+        return false;
     }
 
     /**
      * Returns true t1 can be implicitly cast to t2, false otherwise.
      * If strict is true, only consider casts that result in no loss of precision.
      */
-    public static boolean isImplicitlyCastable(
-            ScalarType t1, ScalarType t2, boolean strict) {
+    public static boolean isImplicitlyCastable(ScalarType t1, ScalarType t2, boolean strict) {
         return getAssignmentCompatibleType(t1, t2, strict).matchesType(t2);
     }
 
+    // TODO(mofei) Why call implicit cast in the explicit cast context
     public static boolean canCastTo(ScalarType type, ScalarType targetType) {
         return PrimitiveType.isImplicitCast(type.getPrimitiveType(), targetType.getPrimitiveType());
     }
@@ -500,16 +531,26 @@ public class ScalarType extends Type implements Cloneable {
                 return "CHAR";
             }
             return "CHAR(" + len + ")";
-        } else if (type.isDecimalV2Type() || type.isDecimalV3Type()) {
+        } else if (type.isDecimalV2Type()) {
             if (isWildcardDecimal()) {
                 return "DECIMAL";
             }
             return "DECIMAL(" + precision + "," + scale + ")";
+        } else if (type.isDecimalV3Type()) {
+            if (isWildcardDecimal()) {
+                return type.toString();
+            }
+            return type + "(" + precision + "," + scale + ")";
         } else if (type == PrimitiveType.VARCHAR) {
             if (isWildcardVarchar()) {
                 return "VARCHAR";
             }
             return "VARCHAR(" + len + ")";
+        } else if (type == PrimitiveType.VARBINARY) {
+            if (len == -1) {
+                return "VARBINARY";
+            }
+            return "VARBINARY(" + len + ")";
         }
         return type.toString();
     }
@@ -519,16 +560,30 @@ public class ScalarType extends Type implements Cloneable {
         StringBuilder stringBuilder = new StringBuilder();
         switch (type) {
             case CHAR:
-                stringBuilder.append("char").append("(").append(len).append(")");
+                if (len == -1) {
+                    stringBuilder.append("char");
+                } else {
+                    stringBuilder.append("char").append("(").append(len).append(")");
+                }
                 break;
             case VARCHAR:
-                stringBuilder.append("varchar").append("(").append(len).append(")");
+                if (len == -1) {
+                    stringBuilder.append("varchar");
+                } else {
+                    stringBuilder.append("varchar").append("(").append(len).append(")");
+                }
+                break;
+            case VARBINARY:
+                stringBuilder.append("varbinary").append("(").append(len).append(")");
                 break;
             case DECIMALV2:
+                stringBuilder.append("decimal").append("(").append(precision).append(", ").append(scale).append(")");
+                break;
             case DECIMAL32:
             case DECIMAL64:
             case DECIMAL128:
-                stringBuilder.append("decimal").append("(").append(precision).append(", ").append(scale).append(")");
+                stringBuilder.append(type.toString().toLowerCase()).append("(").append(precision).append(", ")
+                        .append(scale).append(")");
                 break;
             case BOOLEAN:
                 return "boolean";
@@ -549,10 +604,12 @@ public class ScalarType extends Type implements Cloneable {
             case HLL:
             case BITMAP:
             case PERCENTILE:
+            case JSON:
+            case FUNCTION:
                 stringBuilder.append(type.toString().toLowerCase());
                 break;
             default:
-                stringBuilder.append("unknown type: ").append(type.toString());
+                stringBuilder.append("unknown type: ").append(type);
                 break;
         }
         return stringBuilder.toString();
@@ -568,8 +625,9 @@ public class ScalarType extends Type implements Cloneable {
         TTypeNode node = new TTypeNode();
         container.types.add(node);
         switch (type) {
-            case VARCHAR:
             case CHAR:
+            case VARCHAR:
+            case VARBINARY:
             case HLL: {
                 node.setType(TTypeNodeType.SCALAR);
                 TScalarType scalarType = new TScalarType();
@@ -662,12 +720,18 @@ public class ScalarType extends Type implements Cloneable {
 
     @Override
     public boolean isSupported() {
-        return type != PrimitiveType.BINARY;
+        // BINARY and UNKNOWN_TYPE is unsupported
+        return type != PrimitiveType.BINARY && type != PrimitiveType.UNKNOWN_TYPE;
     }
 
     @Override
     public int getSlotSize() {
         return type.getSlotSize();
+    }
+
+    @Override
+    public int getTypeSize() {
+        return type.getTypeSize();
     }
 
     /**
@@ -680,18 +744,18 @@ public class ScalarType extends Type implements Cloneable {
         if (t.isPseudoType()) {
             return t.matchesType(this);
         }
+        if (isDecimalV2() && t.isDecimalV2()) {
+            return true;
+        }
+        if (this.isStringType() && t.isStringType()) {
+            return true;
+        }
         if (this.getPrimitiveType() == t.getPrimitiveType()) {
             Preconditions.checkArgument(t.isScalarType());
             return !this.isDecimalV3()
                     || t.isWildcardDecimal()
                     || this.isWildcardDecimal()
                     || (getScalarScale() == ((ScalarType) t).getScalarScale());
-        }
-        if (this.isStringType() && t.isStringType()) {
-            return true;
-        }
-        if (isDecimalV2() && t.isDecimalV2()) {
-            return true;
         }
         return false;
     }
@@ -705,10 +769,7 @@ public class ScalarType extends Type implements Cloneable {
         if (type != other.type) {
             return false;
         }
-        if (type == PrimitiveType.CHAR) {
-            return len == other.len;
-        }
-        if (type == PrimitiveType.VARCHAR) {
+        if (type.isVariableLengthType()) {
             return len == other.len;
         }
         if (type.isDecimalV2Type() || type.isDecimalV3Type()) {
@@ -718,47 +779,10 @@ public class ScalarType extends Type implements Cloneable {
     }
 
     @Override
-    public int getStorageLayoutBytes() {
-        switch (type) {
-            case BOOLEAN:
-            case TINYINT:
-                return 1;
-            case SMALLINT:
-                return 2;
-            case INT:
-            case FLOAT:
-            case DECIMAL32:
-                return 4;
-            case BIGINT:
-            case TIME:
-            case DATETIME:
-            case DECIMAL64:
-                return 8;
-            case DECIMAL128:
-            case LARGEINT:
-            case DECIMALV2:
-                return 16;
-            case DOUBLE:
-                return 12;
-            case DATE:
-                return 3;
-            case CHAR:
-            case VARCHAR:
-                return len;
-            case HLL:
-                return 16385;
-            case BITMAP:
-                return 1024; // this is a estimated value
-            default:
-                return 0;
-        }
-    }
-
-    @Override
     public TColumnType toColumnTypeThrift() {
         TColumnType thrift = new TColumnType();
         thrift.type = type.toThrift();
-        if (type == PrimitiveType.CHAR || type == PrimitiveType.VARCHAR || type == PrimitiveType.HLL) {
+        if (type.isVariableLengthType()) {
             thrift.setLen(len);
         }
         if (type.isDecimalV2Type() || type.isDecimalV3Type()) {
@@ -780,5 +804,15 @@ public class ScalarType extends Type implements Cloneable {
     @Override
     public ScalarType clone() {
         return (ScalarType) super.clone();
+    }
+
+    @Override
+    public String canonicalName() {
+        if (isDecimalOfAnyVersion()) {
+            Preconditions.checkArgument(!isWildcardDecimal());
+            return String.format("DECIMAL(%d,%d)", precision, scale);
+        } else {
+            return toString();
+        }
     }
 }

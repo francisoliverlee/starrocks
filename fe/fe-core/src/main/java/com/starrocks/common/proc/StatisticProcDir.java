@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/proc/StatisticProcDir.java
 
@@ -25,20 +38,20 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Multimap;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.LocalTablet;
+import com.starrocks.catalog.LocalTablet.TabletStatus;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Table;
-import com.starrocks.catalog.Table.TableType;
 import com.starrocks.catalog.Tablet;
-import com.starrocks.catalog.Tablet.TabletStatus;
 import com.starrocks.clone.TabletSchedCtx.Priority;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.util.ListComparator;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.task.AgentTaskQueue;
 import com.starrocks.thrift.TTaskType;
@@ -57,7 +70,7 @@ public class StatisticProcDir implements ProcDirInterface {
             .build();
     private static final Logger LOG = LogManager.getLogger(StatisticProcDir.class);
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
 
     // db id -> set(tablet id)
     Multimap<Long, Long> unhealthyTabletIds;
@@ -66,8 +79,8 @@ public class StatisticProcDir implements ProcDirInterface {
     // db id -> set(tablet id)
     Multimap<Long, Long> cloningTabletIds;
 
-    public StatisticProcDir(Catalog catalog) {
-        this.catalog = catalog;
+    public StatisticProcDir(GlobalStateMgr globalStateMgr) {
+        this.globalStateMgr = globalStateMgr;
         unhealthyTabletIds = HashMultimap.create();
         inconsistentTabletIds = HashMultimap.create();
         cloningTabletIds = HashMultimap.create();
@@ -75,18 +88,18 @@ public class StatisticProcDir implements ProcDirInterface {
 
     @Override
     public ProcResult fetchResult() throws AnalysisException {
-        Preconditions.checkNotNull(catalog);
+        Preconditions.checkNotNull(globalStateMgr);
 
         BaseProcResult result = new BaseProcResult();
 
         result.setNames(TITLE_NAMES);
-        List<Long> dbIds = catalog.getDbIds();
+        List<Long> dbIds = globalStateMgr.getDbIds();
         if (dbIds == null || dbIds.isEmpty()) {
             // empty
             return result;
         }
 
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
 
         int totalDbNum = 0;
         int totalTableNum = 0;
@@ -104,13 +117,13 @@ public class StatisticProcDir implements ProcDirInterface {
                 // skip information_schema database
                 continue;
             }
-            Database db = catalog.getDb(dbId);
+            Database db = globalStateMgr.getDb(dbId);
             if (db == null) {
                 continue;
             }
 
             ++totalDbNum;
-            List<Long> aliveBeIdsInCluster = infoService.getClusterBackendIds(db.getClusterName(), true);
+            List<Long> aliveBeIdsInCluster = infoService.getBackendIds(true);
             db.readLock();
             try {
                 int dbTableNum = 0;
@@ -120,7 +133,7 @@ public class StatisticProcDir implements ProcDirInterface {
                 int dbReplicaNum = 0;
 
                 for (Table table : db.getTables()) {
-                    if (table.getType() != TableType.OLAP) {
+                    if (!table.isNativeTable()) {
                         continue;
                     }
 
@@ -135,11 +148,16 @@ public class StatisticProcDir implements ProcDirInterface {
                             ++dbIndexNum;
                             for (Tablet tablet : materializedIndex.getTablets()) {
                                 ++dbTabletNum;
-                                dbReplicaNum += tablet.getReplicas().size();
 
-                                Pair<TabletStatus, Priority> res = tablet.getHealthStatusWithPriority(
-                                        infoService, db.getClusterName(),
-                                        partition.getVisibleVersion(), partition.getVisibleVersionHash(),
+                                if (table.isCloudNativeTable()) {
+                                    continue;
+                                }
+
+                                LocalTablet localTablet = (LocalTablet) tablet;
+                                dbReplicaNum += localTablet.getImmutableReplicas().size();
+
+                                Pair<TabletStatus, Priority> res = localTablet.getHealthStatusWithPriority(
+                                        infoService, partition.getVisibleVersion(),
                                         replicationNum, aliveBeIdsInCluster);
 
                                 // here we treat REDUNDANT as HEALTHY, for user friendly.
@@ -149,7 +167,7 @@ public class StatisticProcDir implements ProcDirInterface {
                                     unhealthyTabletIds.put(dbId, tablet.getId());
                                 }
 
-                                if (!tablet.isConsistent()) {
+                                if (!localTablet.isConsistent()) {
                                     inconsistentTabletIds.put(dbId, tablet.getId());
                                 }
                             } // end for tablets
@@ -223,6 +241,10 @@ public class StatisticProcDir implements ProcDirInterface {
             dbId = Long.valueOf(dbIdStr);
         } catch (NumberFormatException e) {
             throw new AnalysisException("Invalid db id format: " + dbIdStr);
+        }
+
+        if (globalStateMgr.getDb(dbId) == null) {
+            throw new AnalysisException("Invalid db id: " + dbIdStr);
         }
 
         return new IncompleteTabletsProcNode(unhealthyTabletIds.get(dbId),

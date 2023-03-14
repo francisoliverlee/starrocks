@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/loadv2/LoadManager.java
 
@@ -25,16 +38,15 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.analysis.CancelLoadStmt;
-import com.starrocks.analysis.LoadStmt;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
-import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.Config;
 import com.starrocks.common.DataQualityException;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.LabelAlreadyUsedException;
+import com.starrocks.common.LoadException;
 import com.starrocks.common.MetaNotFoundException;
+import com.starrocks.common.TimeoutException;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.LogBuilder;
@@ -43,29 +55,39 @@ import com.starrocks.load.EtlJobType;
 import com.starrocks.load.FailMsg;
 import com.starrocks.load.FailMsg.CancelType;
 import com.starrocks.load.Load;
+import com.starrocks.persist.AlterLoadJobOperationLog;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AlterLoadStmt;
+import com.starrocks.sql.ast.CancelLoadStmt;
+import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.thrift.TLoadJobType;
 import com.starrocks.thrift.TUniqueId;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 /**
- * The broker and mini load jobs(v2) are included in this class.
+ * The broker and spark load jobs are included in this class.
  * <p>
  * The lock sequence:
  * Database.lock
@@ -91,7 +113,7 @@ public class LoadManager implements Writable {
      * @param stmt
      * @throws DdlException
      */
-    public void createLoadJobFromStmt(LoadStmt stmt) throws DdlException {
+    public void createLoadJobFromStmt(LoadStmt stmt, ConnectContext context) throws DdlException {
         Database database = checkDb(stmt.getLabel().getDbName());
         long dbId = database.getId();
         LoadJob loadJob = null;
@@ -106,16 +128,46 @@ public class LoadManager implements Writable {
                         "There are more than " + Config.desired_max_waiting_jobs + " load jobs in waiting queue, "
                                 + "please retry later.");
             }
-            loadJob = BulkLoadJob.fromLoadStmt(stmt);
+            loadJob = BulkLoadJob.fromLoadStmt(stmt, context);
             createLoadJob(loadJob);
         } finally {
             writeUnlock();
         }
-        Catalog.getCurrentCatalog().getEditLog().logCreateLoadJob(loadJob);
+        GlobalStateMgr.getCurrentState().getEditLog().logCreateLoadJob(loadJob);
 
         // The job must be submitted after edit log.
         // It guarantee that load job has not been changed before edit log.
         loadJobScheduler.submitJob(loadJob);
+    }
+
+    public void alterLoadJob(AlterLoadStmt stmt) throws DdlException {
+        Database db = GlobalStateMgr.getCurrentState().getDb(stmt.getDbName());
+        if (db == null) {
+            throw new DdlException("Db does not exist. name: " + stmt.getDbName());
+        }
+
+        LoadJob loadJob = null;
+        readLock();
+        try {
+            Map<String, List<LoadJob>> labelToLoadJobs = dbIdToLabelToLoadJobs.get(db.getId());
+            if (labelToLoadJobs == null) {
+                throw new DdlException("Load job does not exist");
+            }
+            List<LoadJob> loadJobList = labelToLoadJobs.get(stmt.getLabel());
+            if (loadJobList == null) {
+                throw new DdlException("Load job does not exist");
+            }
+            Optional<LoadJob> loadJobOptional = loadJobList.stream().filter(entity -> !entity.isTxnDone()).findFirst();
+            if (!loadJobOptional.isPresent()) {
+                throw new DdlException("There is no uncompleted job which label is " + stmt.getLabel());
+            }
+            loadJob = loadJobOptional.get();
+
+        } finally {
+            readUnlock();
+        }
+
+        loadJob.alterJob(stmt);
     }
 
     public void replayCreateLoadJob(LoadJob loadJob) {
@@ -130,7 +182,9 @@ public class LoadManager implements Writable {
         addLoadJob(loadJob);
         // add callback before txn created, because callback will be performed on replay without txn begin
         // register txn state listener
-        Catalog.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(loadJob);
+        if (!loadJob.isCompleted()) {
+            GlobalStateMgr.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(loadJob);
+        }
     }
 
     private void addLoadJob(LoadJob loadJob) {
@@ -146,12 +200,33 @@ public class LoadManager implements Writable {
         labelToLoadJobs.get(loadJob.getLabel()).add(loadJob);
     }
 
-    public void recordFinishedLoadJob(String label, String dbName, long tableId, EtlJobType jobType,
-                                      long createTimestamp, String failMsg, String trackingUrl)
-            throws MetaNotFoundException {
+    public void recordFinishedOrCacnelledLoadJob(long jobId, EtlJobType jobType, String failMsg, String trackingUrl)
+            throws UserException {
+        LoadJob loadJob = getLoadJob(jobId);
+        if (loadJob.isTxnDone() && !Strings.isNullOrEmpty(failMsg)) {
+            throw new LoadException("LoadJob " + jobId + " state " + loadJob.getState().name() + ", can not be cancal");
+        }
+        if (loadJob.isCompleted()) {
+            throw new LoadException("LoadJob " + jobId + " state " + loadJob.getState().name() + ", can not be cancal/publish");
+        }
+        switch (jobType) {
+            case INSERT:
+                InsertLoadJob insertLoadJob = (InsertLoadJob) loadJob;
+                insertLoadJob.setLoadFinishOrCancel(failMsg, trackingUrl);
+                break;
+            default:
+                throw new LoadException("Unknown job type [" + jobType.name() + "]");
+        }
+        return;
+    }
+
+
+    public long registerLoadJob(String label, String dbName, long tableId, EtlJobType jobType,
+                                long createTimestamp, long estimateScanRows, TLoadJobType type, long timeout)
+            throws UserException {
 
         // get db id
-        Database db = Catalog.getCurrentCatalog().getDb(dbName);
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
         if (db == null) {
             throw new MetaNotFoundException("Database[" + dbName + "] does not exist");
         }
@@ -159,18 +234,19 @@ public class LoadManager implements Writable {
         LoadJob loadJob;
         switch (jobType) {
             case INSERT:
-                loadJob = new InsertLoadJob(label, db.getId(), tableId, createTimestamp, failMsg, trackingUrl);
+                loadJob = new InsertLoadJob(label, db.getId(), tableId, createTimestamp, estimateScanRows, type, timeout);
                 break;
             default:
-                return;
+                throw new LoadException("Unknown job type [" + jobType.name() + "]");
         }
         addLoadJob(loadJob);
         // persistent
-        Catalog.getCurrentCatalog().getEditLog().logCreateLoadJob(loadJob);
+        GlobalStateMgr.getCurrentState().getEditLog().logCreateLoadJob(loadJob);
+        return loadJob.getId();
     }
 
     public void cancelLoadJob(CancelLoadStmt stmt) throws DdlException {
-        Database db = Catalog.getCurrentCatalog().getDb(stmt.getDbName());
+        Database db = GlobalStateMgr.getCurrentState().getDb(stmt.getDbName());
         if (db == null) {
             throw new DdlException("Db does not exist. name: " + stmt.getDbName());
         }
@@ -209,11 +285,18 @@ public class LoadManager implements Writable {
             LOG.warn("job does not exist when replaying end load job edit log: {}", operation);
             return;
         }
-        job.unprotectReadEndOperation(operation);
+        job.unprotectReadEndOperation(operation, true);
+
+        GlobalStateMgr.getCurrentGlobalTransactionMgr().getCallbackFactory().removeCallback(job.id);
+
         LOG.info(new LogBuilder(LogKey.LOAD_JOB, operation.getId())
                 .add("operation", operation)
                 .add("msg", "replay end load job")
                 .build());
+        if (isJobExpired(job, System.currentTimeMillis())) {
+            LOG.info("remove expired job: {}", job);
+            unprotectedRemoveJobReleatedMeta(job);
+        }
     }
 
     public void replayUpdateLoadJobStateInfo(LoadJob.LoadJobStateUpdateInfo info) {
@@ -225,6 +308,22 @@ public class LoadManager implements Writable {
         }
 
         job.replayUpdateStateInfo(info);
+
+        if (isJobExpired(job, System.currentTimeMillis())) {
+            LOG.info("remove expired job: {}", job);
+            unprotectedRemoveJobReleatedMeta(job);
+        }
+    }
+
+    public void replayAlterLoadJob(AlterLoadJobOperationLog op) {
+        long jobId = op.getJobId();
+        LoadJob job = idToLoadJob.get(jobId);
+        if (job == null) {
+            LOG.warn("replay alter load job state failed. error: job not found, id: {}", jobId);
+            return;
+        }
+
+        job.replayAlterJob(op);
     }
 
     public long getLoadJobNum(JobState jobState, long dbId) {
@@ -276,33 +375,51 @@ public class LoadManager implements Writable {
         }
     }
 
+    private boolean isJobExpired(LoadJob job, long currentTimeMs) {
+        if (!job.isCompleted()) {
+            return false;
+        }
+        return (currentTimeMs - job.getFinishTimestamp()) / 1000 > Config.label_keep_max_second;
+    }
+
     public void removeOldLoadJob() {
         long currentTimeMs = System.currentTimeMillis();
 
         writeLock();
         try {
-            // get completed jobs
-            List<LoadJob> jobs =
-                    idToLoadJob.values().stream().filter(job -> job.isCompleted()).collect(Collectors.toList());
-            if (jobs.isEmpty()) {
-                return;
-            }
-
-            // sort by finish time asc
-            Collections.sort(jobs, new Comparator<LoadJob>() {
+            // add load job to a sorted tree set
+            Set<LoadJob> jobs = new TreeSet<>(new Comparator<LoadJob>() {
                 @Override
                 public int compare(LoadJob o1, LoadJob o2) {
+                    // sort by finish time desc
                     return Long.signum(o1.getFinishTimestamp() - o2.getFinishTimestamp());
                 }
             });
 
-            // remove jobs by label_keep_max_second and label_keep_max_num
-            int labelKeepMaxSecond = Config.label_keep_max_second;
-            int numJobsToRemove = idToLoadJob.size() - Config.label_keep_max_num;
-            for (LoadJob job : jobs) {
-                if ((currentTimeMs - job.getFinishTimestamp()) / 1000 > labelKeepMaxSecond || numJobsToRemove > 0) {
+            for (Map.Entry<Long, LoadJob> entry : idToLoadJob.entrySet()) {
+                LoadJob job = entry.getValue();
+                if (!job.isCompleted()) {
+                    continue;
+                }
+                if (isJobExpired(job, currentTimeMs)) {
+                    // remove expired job
+                    LOG.info("remove expired job: {}", job.getLabel());
                     unprotectedRemoveJobReleatedMeta(job);
-                    --numJobsToRemove;
+                } else {
+                    jobs.add(job);
+                }
+            }
+
+            // if there are still more jobs than LABEL_KEEP_MAX_NUM
+            // remove the ones that finished earlier
+            int numJobsToRemove = idToLoadJob.size() - Config.label_keep_max_num;
+            if (numJobsToRemove > 0) {
+                LOG.info("remove {} jobs from {}", numJobsToRemove, jobs.size());
+                Iterator<LoadJob> iterator = jobs.iterator();
+                for (int i = 0; i != numJobsToRemove && iterator.hasNext(); ++i) {
+                    LoadJob job = iterator.next();
+                    LOG.info("remove redundant job: {}", job.getLabel());
+                    unprotectedRemoveJobReleatedMeta(job);
                 }
             }
         } finally {
@@ -326,6 +443,9 @@ public class LoadManager implements Writable {
                         job.cancelJobWithoutCheck(new FailMsg(FailMsg.CancelType.ETL_QUALITY_UNSATISFIED,
                                         DataQualityException.QUALITY_FAIL_MSG),
                                 true, true);
+                    } catch (TimeoutException e) {
+                        // timeout, retry next time
+                        LOG.warn("update load job etl status failed. job id: {}", job.getId(), e);
                     } catch (UserException e) {
                         LOG.warn("update load job etl status failed. job id: {}", job.getId(), e);
                         job.cancelJobWithoutCheck(new FailMsg(CancelType.ETL_RUN_FAIL, e.getMessage()), true, true);
@@ -363,10 +483,8 @@ public class LoadManager implements Writable {
      */
     public List<List<Comparable>> getLoadJobInfosByDb(long dbId, String labelValue,
                                                       boolean accurateMatch, Set<String> statesValue) {
-        LinkedList<List<Comparable>> loadJobInfos = new LinkedList<List<Comparable>>();
-        if (!dbIdToLabelToLoadJobs.containsKey(dbId)) {
-            return loadJobInfos;
-        }
+
+        LinkedList<List<Comparable>> loadJobInfos = new LinkedList<>();
 
         Set<JobState> states = Sets.newHashSet();
         if (statesValue == null || statesValue.size() == 0) {
@@ -381,10 +499,32 @@ public class LoadManager implements Writable {
             }
         }
 
+        List<LoadJob> loadJobList = getLoadJobsByDb(dbId, labelValue, accurateMatch);
+        // check state
+        for (LoadJob loadJob : loadJobList) {
+            try {
+                if (!states.contains(loadJob.getState())) {
+                    continue;
+                }
+                // add load job info
+                loadJobInfos.add(loadJob.getShowInfo());
+            } catch (DdlException ignored) {
+                // ignored
+            }
+        }
+        return loadJobInfos;
+    }
+
+    public List<LoadJob> getLoadJobsByDb(long dbId, String labelValue, boolean accurateMatch) {
+
+        List<LoadJob> loadJobList = Lists.newArrayList();
+        if (!dbIdToLabelToLoadJobs.containsKey(dbId)) {
+            return loadJobList;
+        }
         readLock();
         try {
             Map<String, List<LoadJob>> labelToLoadJobs = dbIdToLabelToLoadJobs.get(dbId);
-            List<LoadJob> loadJobList = Lists.newArrayList();
+
             if (Strings.isNullOrEmpty(labelValue)) {
                 loadJobList.addAll(labelToLoadJobs.values()
                         .stream().flatMap(Collection::stream).collect(Collectors.toList()));
@@ -392,7 +532,7 @@ public class LoadManager implements Writable {
                 // check label value
                 if (accurateMatch) {
                     if (!labelToLoadJobs.containsKey(labelValue)) {
-                        return loadJobInfos;
+                        return loadJobList;
                     }
                     loadJobList.addAll(labelToLoadJobs.get(labelValue));
                 } else {
@@ -404,28 +544,13 @@ public class LoadManager implements Writable {
                     }
                 }
             }
-
-            // check state
-            for (LoadJob loadJob : loadJobList) {
-                try {
-                    if (!states.contains(loadJob.getState())) {
-                        continue;
-                    }
-                    // add load job info
-                    loadJobInfos.add(loadJob.getShowInfo());
-                } catch (DdlException e) {
-                    continue;
-                }
-            }
-            return loadJobInfos;
+            return loadJobList;
         } finally {
             readUnlock();
         }
     }
 
     public void getLoadJobInfo(Load.JobInfo info) throws DdlException {
-        String fullDbName = ClusterNamespace.getFullName(info.clusterName, info.dbName);
-        info.dbName = fullDbName;
         Database database = checkDb(info.dbName);
         readLock();
         try {
@@ -470,7 +595,7 @@ public class LoadManager implements Writable {
 
     private Database checkDb(String dbName) throws DdlException {
         // get db
-        Database db = Catalog.getCurrentCatalog().getDb(dbName);
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
         if (db == null) {
             LOG.warn("Database {} does not exist", dbName);
             throw new DdlException("Database[" + dbName + "] does not exist");
@@ -544,10 +669,10 @@ public class LoadManager implements Writable {
     }
 
     public void updateJobPrgress(Long jobId, Long beId, TUniqueId loadId, TUniqueId fragmentId,
-                                 long scannedRows, boolean isDone) {
+                                 long sinkRows, long sinkBytes, long sourceRows, long sourceBytes, boolean isDone) {
         LoadJob job = idToLoadJob.get(jobId);
         if (job != null) {
-            job.updateProgess(beId, loadId, fragmentId, scannedRows, isDone);
+            job.updateProgess(beId, loadId, fragmentId, sinkRows, sinkBytes, sourceRows, sourceBytes, isDone);
         }
     }
 
@@ -563,8 +688,14 @@ public class LoadManager implements Writable {
 
     public void readFields(DataInput in) throws IOException {
         int size = in.readInt();
+        long now = System.currentTimeMillis();
         for (int i = 0; i < size; i++) {
             LoadJob loadJob = LoadJob.read(in);
+            // discard expired job right away
+            if (isJobExpired(loadJob, now)) {
+                LOG.info("discard expired job: {}", loadJob);
+                continue;
+            }
             idToLoadJob.put(loadJob.getId(), loadJob);
             Map<String, List<LoadJob>> map = dbIdToLabelToLoadJobs.get(loadJob.getDbId());
             if (map == null) {
@@ -582,8 +713,21 @@ public class LoadManager implements Writable {
             // The commit and visible txn will callback the unfinished load job.
             // Otherwise, the load job always does not be completed while the txn is visible.
             if (!loadJob.isCompleted()) {
-                Catalog.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(loadJob);
+                GlobalStateMgr.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(loadJob);
             }
         }
+    }
+
+    public long loadLoadJobsV2(DataInputStream in, long checksum) throws IOException {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_50) {
+            readFields(in);
+        }
+        LOG.info("finished replay loadJobsV2 from image");
+        return checksum;
+    }
+
+    public long saveLoadJobsV2(DataOutputStream out, long checksum) throws IOException {
+        write(out);
+        return checksum;
     }
 }

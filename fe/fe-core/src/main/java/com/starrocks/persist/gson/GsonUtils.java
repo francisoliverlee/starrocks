@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/persist/gson/GsonUtils.java
 
@@ -49,27 +62,68 @@ import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
 import com.starrocks.alter.AlterJobV2;
+import com.starrocks.alter.LakeTableSchemaChangeJob;
 import com.starrocks.alter.RollupJobV2;
 import com.starrocks.alter.SchemaChangeJobV2;
+import com.starrocks.analysis.Expr;
+import com.starrocks.backup.SnapshotInfo;
 import com.starrocks.catalog.AnyArrayType;
 import com.starrocks.catalog.AnyElementType;
 import com.starrocks.catalog.ArrayType;
+import com.starrocks.catalog.CatalogRecycleBin;
 import com.starrocks.catalog.DistributionInfo;
+import com.starrocks.catalog.ExpressionRangePartitionInfo;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.HiveResource;
+import com.starrocks.catalog.HudiResource;
+import com.starrocks.catalog.IcebergResource;
+import com.starrocks.catalog.JDBCResource;
+import com.starrocks.catalog.ListPartitionInfo;
+import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MapType;
 import com.starrocks.catalog.OdbcCatalogResource;
+import com.starrocks.catalog.PartitionInfo;
+import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.PseudoType;
 import com.starrocks.catalog.RandomDistributionInfo;
+import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Resource;
 import com.starrocks.catalog.ScalarType;
+import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.SparkResource;
 import com.starrocks.catalog.StructType;
+import com.starrocks.catalog.Tablet;
+import com.starrocks.lake.LakeMaterializedView;
+import com.starrocks.lake.LakeTable;
+import com.starrocks.lake.LakeTablet;
+import com.starrocks.lake.backup.LakeTableSnapshotInfo;
 import com.starrocks.load.loadv2.LoadJob.LoadJobStateUpdateInfo;
 import com.starrocks.load.loadv2.SparkLoadJob.SparkLoadJobStateUpdateInfo;
+import com.starrocks.persist.ListPartitionPersistInfo;
+import com.starrocks.persist.PartitionPersistInfoV2;
+import com.starrocks.persist.RangePartitionPersistInfo;
+import com.starrocks.persist.SinglePartitionPersistInfo;
+import com.starrocks.privilege.CatalogPEntryObject;
+import com.starrocks.privilege.DbPEntryObject;
+import com.starrocks.privilege.FunctionPEntryObject;
+import com.starrocks.privilege.GlobalFunctionPEntryObject;
+import com.starrocks.privilege.MaterializedViewPEntryObject;
+import com.starrocks.privilege.PEntryObject;
+import com.starrocks.privilege.ResourceGroupPEntryObject;
+import com.starrocks.privilege.ResourcePEntryObject;
+import com.starrocks.privilege.TablePEntryObject;
+import com.starrocks.privilege.UserPEntryObject;
+import com.starrocks.privilege.ViewPEntryObject;
+import com.starrocks.qe.SqlModeHelper;
+import com.starrocks.sql.optimizer.dump.HiveTableDumpInfo;
 import com.starrocks.sql.optimizer.dump.QueryDumpDeserializer;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
 import com.starrocks.sql.optimizer.dump.QueryDumpSerializer;
+import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.system.BackendHbResponse;
+import com.starrocks.system.BrokerHbResponse;
+import com.starrocks.system.FrontendHbResponse;
+import com.starrocks.system.HeartbeatResponse;
 
 import java.io.IOException;
 import java.lang.reflect.Method;
@@ -99,7 +153,7 @@ import java.util.Map;
 public class GsonUtils {
 
     // runtime adapter for class "Type"
-    private static final RuntimeTypeAdapterFactory<com.starrocks.catalog.Type> columnTypeAdapterFactory =
+    private static final RuntimeTypeAdapterFactory<com.starrocks.catalog.Type> COLUMN_TYPE_ADAPTER_FACTORY =
             RuntimeTypeAdapterFactory
                     .of(com.starrocks.catalog.Type.class, "clazz")
                     .registerSubtype(ScalarType.class, ScalarType.class.getSimpleName())
@@ -111,59 +165,159 @@ public class GsonUtils {
                     .registerSubtype(AnyArrayType.class, AnyArrayType.class.getSimpleName());
 
     // runtime adapter for class "DistributionInfo"
-    private static final RuntimeTypeAdapterFactory<DistributionInfo> distributionInfoTypeAdapterFactory =
+    private static final RuntimeTypeAdapterFactory<DistributionInfo> DISTRIBUTION_INFO_TYPE_ADAPTER_FACTORY =
             RuntimeTypeAdapterFactory
                     .of(DistributionInfo.class, "clazz")
                     .registerSubtype(HashDistributionInfo.class, HashDistributionInfo.class.getSimpleName())
                     .registerSubtype(RandomDistributionInfo.class, RandomDistributionInfo.class.getSimpleName());
 
+    private static final RuntimeTypeAdapterFactory<PartitionInfo> PARTITION_INFO_TYPE_ADAPTER_FACTORY =
+            RuntimeTypeAdapterFactory
+                    .of(PartitionInfo.class, "clazz")
+                    .registerSubtype(RangePartitionInfo.class, RangePartitionInfo.class.getSimpleName())
+                    .registerSubtype(ListPartitionInfo.class, ListPartitionInfo.class.getSimpleName())
+                    .registerSubtype(SinglePartitionInfo.class, SinglePartitionInfo.class.getSimpleName())
+                    .registerSubtype(ExpressionRangePartitionInfo.class,
+                            ExpressionRangePartitionInfo.class.getSimpleName());
+
     // runtime adapter for class "Resource"
-    private static final RuntimeTypeAdapterFactory<Resource> resourceTypeAdapterFactory = RuntimeTypeAdapterFactory
+    private static final RuntimeTypeAdapterFactory<Resource> RESOURCE_TYPE_ADAPTER_FACTORY = RuntimeTypeAdapterFactory
             .of(Resource.class, "clazz")
             .registerSubtype(SparkResource.class, SparkResource.class.getSimpleName())
             .registerSubtype(HiveResource.class, HiveResource.class.getSimpleName())
-            .registerSubtype(OdbcCatalogResource.class, OdbcCatalogResource.class.getSimpleName());
+            .registerSubtype(IcebergResource.class, IcebergResource.class.getSimpleName())
+            .registerSubtype(HudiResource.class, HudiResource.class.getSimpleName())
+            .registerSubtype(OdbcCatalogResource.class, OdbcCatalogResource.class.getSimpleName())
+            .registerSubtype(JDBCResource.class, JDBCResource.class.getSimpleName());
 
     // runtime adapter for class "AlterJobV2"
-    private static final RuntimeTypeAdapterFactory<AlterJobV2> alterJobV2TypeAdapterFactory = RuntimeTypeAdapterFactory
-            .of(AlterJobV2.class, "clazz")
-            .registerSubtype(RollupJobV2.class, RollupJobV2.class.getSimpleName())
-            .registerSubtype(SchemaChangeJobV2.class, SchemaChangeJobV2.class.getSimpleName());
+    private static final RuntimeTypeAdapterFactory<AlterJobV2> ALTER_JOB_V2_TYPE_ADAPTER_FACTORY =
+            RuntimeTypeAdapterFactory.of(AlterJobV2.class, "clazz")
+                    .registerSubtype(RollupJobV2.class, RollupJobV2.class.getSimpleName())
+                    .registerSubtype(SchemaChangeJobV2.class, SchemaChangeJobV2.class.getSimpleName())
+                    .registerSubtype(LakeTableSchemaChangeJob.class, LakeTableSchemaChangeJob.class.getSimpleName());
 
     // runtime adapter for class "LoadJobStateUpdateInfo"
-    private static final RuntimeTypeAdapterFactory<LoadJobStateUpdateInfo> loadJobStateUpdateInfoTypeAdapterFactory
-            = RuntimeTypeAdapterFactory
+    private static final RuntimeTypeAdapterFactory<LoadJobStateUpdateInfo>
+            LOAD_JOB_STATE_UPDATE_INFO_TYPE_ADAPTER_FACTORY = RuntimeTypeAdapterFactory
             .of(LoadJobStateUpdateInfo.class, "clazz")
             .registerSubtype(SparkLoadJobStateUpdateInfo.class, SparkLoadJobStateUpdateInfo.class.getSimpleName());
 
-    private static final JsonSerializer<LocalDateTime> localDateTimeTypeSerializer =
+    // runtime adapter for class "Tablet"
+    private static final RuntimeTypeAdapterFactory<Tablet> TABLET_TYPE_ADAPTER_FACTORY = RuntimeTypeAdapterFactory
+            .of(Tablet.class, "clazz")
+            .registerSubtype(LocalTablet.class, LocalTablet.class.getSimpleName(), true)
+            .registerSubtype(LakeTablet.class, LakeTablet.class.getSimpleName());
+
+    // runtime adapter for HeartbeatResponse
+    private static final RuntimeTypeAdapterFactory<HeartbeatResponse> HEARTBEAT_RESPONSE_ADAPTER_FACTOR =
+            RuntimeTypeAdapterFactory
+                    .of(HeartbeatResponse.class, "clazz")
+                    .registerSubtype(BackendHbResponse.class, BackendHbResponse.class.getSimpleName())
+                    .registerSubtype(FrontendHbResponse.class, FrontendHbResponse.class.getSimpleName())
+                    .registerSubtype(BrokerHbResponse.class, BrokerHbResponse.class.getSimpleName());
+
+    private static final RuntimeTypeAdapterFactory<PartitionPersistInfoV2> PARTITION_PERSIST_INFO_V_2_ADAPTER_FACTORY
+            = RuntimeTypeAdapterFactory.of(PartitionPersistInfoV2.class, "clazz")
+            .registerSubtype(ListPartitionPersistInfo.class, ListPartitionPersistInfo.class.getSimpleName())
+            .registerSubtype(RangePartitionPersistInfo.class, RangePartitionPersistInfo.class.getSimpleName())
+            .registerSubtype(SinglePartitionPersistInfo.class, SinglePartitionPersistInfo.class.getSimpleName());
+
+    private static final RuntimeTypeAdapterFactory<CatalogRecycleBin.RecyclePartitionInfoV2>
+            RECYCLE_PARTITION_INFO_V_2_ADAPTER_FACTORY
+            = RuntimeTypeAdapterFactory.of(CatalogRecycleBin.RecyclePartitionInfoV2.class, "clazz")
+            .registerSubtype(CatalogRecycleBin.RecycleRangePartitionInfo.class,
+                    CatalogRecycleBin.RecycleRangePartitionInfo.class.getSimpleName());
+
+    private static final RuntimeTypeAdapterFactory<com.starrocks.catalog.Table> TABLE_TYPE_ADAPTER_FACTORY
+            = RuntimeTypeAdapterFactory.of(com.starrocks.catalog.Table.class, "clazz")
+            .registerSubtype(LakeTable.class, LakeTable.class.getSimpleName())
+            .registerSubtype(LakeMaterializedView.class, LakeMaterializedView.class.getSimpleName());
+
+    private static final RuntimeTypeAdapterFactory<SnapshotInfo> SNAPSHOT_INFO_TYPE_ADAPTER_FACTORY
+            = RuntimeTypeAdapterFactory.of(SnapshotInfo.class, "clazz")
+            .registerSubtype(LakeTableSnapshotInfo.class, LakeTableSnapshotInfo.class.getSimpleName());
+
+    private static final RuntimeTypeAdapterFactory<PEntryObject> P_ENTRY_OBJECT_RUNTIME_TYPE_ADAPTER_FACTORY =
+            RuntimeTypeAdapterFactory.of(PEntryObject.class, "clazz")
+                    .registerSubtype(DbPEntryObject.class, DbPEntryObject.class.getSimpleName())
+                    .registerSubtype(TablePEntryObject.class, TablePEntryObject.class.getSimpleName())
+                    .registerSubtype(UserPEntryObject.class, UserPEntryObject.class.getSimpleName())
+                    .registerSubtype(ResourcePEntryObject.class, ResourcePEntryObject.class.getSimpleName())
+                    .registerSubtype(ViewPEntryObject.class, ViewPEntryObject.class.getSimpleName())
+                    .registerSubtype(MaterializedViewPEntryObject.class,
+                            MaterializedViewPEntryObject.class.getSimpleName())
+                    .registerSubtype(GlobalFunctionPEntryObject.class,
+                            GlobalFunctionPEntryObject.class.getSimpleName())
+                    .registerSubtype(FunctionPEntryObject.class, FunctionPEntryObject.class.getSimpleName())
+                    .registerSubtype(CatalogPEntryObject.class, CatalogPEntryObject.class.getSimpleName())
+                    .registerSubtype(ResourceGroupPEntryObject.class,
+                            ResourceGroupPEntryObject.class.getSimpleName());
+
+    private static final JsonSerializer<LocalDateTime> LOCAL_DATE_TIME_TYPE_SERIALIZER =
             (dateTime, type, jsonSerializationContext) -> new JsonPrimitive(dateTime.toEpochSecond(ZoneOffset.UTC));
 
-    private static final JsonDeserializer<LocalDateTime> localDateTimeTypeDeserializer =
+    private static final JsonDeserializer<LocalDateTime> LOCAL_DATE_TIME_TYPE_DESERIALIZER =
             (jsonElement, type, jsonDeserializationContext) -> LocalDateTime
                     .ofEpochSecond(jsonElement.getAsJsonPrimitive().getAsLong(), 0, ZoneOffset.UTC);
 
-    private static final JsonSerializer<QueryDumpInfo> dumpInfoSerializer = new QueryDumpSerializer();
+    private static final JsonSerializer<QueryDumpInfo> DUMP_INFO_SERIALIZER = new QueryDumpSerializer();
 
-    private static final JsonDeserializer<QueryDumpInfo> dumpInfoDeserializer = new QueryDumpDeserializer();
+    private static final JsonDeserializer<QueryDumpInfo> DUMP_INFO_DESERIALIZER = new QueryDumpDeserializer();
+
+    private static final JsonSerializer<HiveTableDumpInfo> HIVE_TABLE_DUMP_INFO_SERIALIZER = new HiveTableDumpInfo.
+            HiveTableDumpInfoSerializer();
+
+    private static final JsonDeserializer<HiveTableDumpInfo> HIVE_TABLE_DUMP_INFO_DESERIALIZER = new HiveTableDumpInfo.
+            HiveTableDumpInfoDeserializer();
+
+    private static final JsonSerializer<Expr> EXPRESSION_SERIALIZER = new ExpressionSerializer();
+
+    private static final JsonDeserializer<Expr> EXPRESSION_DESERIALIZER = new ExpressionDeserializer();
+
+    private static final JsonDeserializer<PrimitiveType> PRIMITIVE_TYPE_DESERIALIZER = new PrimitiveTypeDeserializer();
+
+    private static final JsonDeserializer<MapType> MAP_TYPE_JSON_DESERIALIZER = new MapType.MapTypeDeserializer();
+
+    private static final JsonDeserializer<StructType> STRUCT_TYPE_JSON_DESERIALIZER =
+            new StructType.StructTypeDeserializer();
 
     // the builder of GSON instance.
     // Add any other adapters if necessary.
     private static final GsonBuilder GSON_BUILDER = new GsonBuilder()
             .addSerializationExclusionStrategy(new HiddenAnnotationExclusionStrategy())
+            .addDeserializationExclusionStrategy(new HiddenAnnotationExclusionStrategy())
             .enableComplexMapKeySerialization()
             .registerTypeHierarchyAdapter(Table.class, new GuavaTableAdapter())
             .registerTypeHierarchyAdapter(Multimap.class, new GuavaMultimapAdapter())
-            .registerTypeAdapterFactory(new PostProcessTypeAdapterFactory())
-            .registerTypeAdapterFactory(columnTypeAdapterFactory)
-            .registerTypeAdapterFactory(distributionInfoTypeAdapterFactory)
-            .registerTypeAdapterFactory(resourceTypeAdapterFactory)
-            .registerTypeAdapterFactory(alterJobV2TypeAdapterFactory)
-            .registerTypeAdapterFactory(loadJobStateUpdateInfoTypeAdapterFactory)
-            .registerTypeAdapter(LocalDateTime.class, localDateTimeTypeSerializer)
-            .registerTypeAdapter(LocalDateTime.class, localDateTimeTypeDeserializer)
-            .registerTypeAdapter(QueryDumpInfo.class, dumpInfoSerializer)
-            .registerTypeAdapter(QueryDumpInfo.class, dumpInfoDeserializer);
+            .registerTypeAdapterFactory(new ProcessHookTypeAdapterFactory())
+            // specified childcalss DeSerializer must be ahead of fatherclass,
+            // because when GsonBuilder::create() will reverse it,
+            // and gson::getDelegateAdapter will skip the factory ahead of father TypeAdapterFactory factory.
+            .registerTypeAdapter(MapType.class, MAP_TYPE_JSON_DESERIALIZER)
+            .registerTypeAdapter(StructType.class, STRUCT_TYPE_JSON_DESERIALIZER)
+            .registerTypeAdapterFactory(COLUMN_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(DISTRIBUTION_INFO_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(RESOURCE_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(ALTER_JOB_V2_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(LOAD_JOB_STATE_UPDATE_INFO_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(TABLET_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(HEARTBEAT_RESPONSE_ADAPTER_FACTOR)
+            .registerTypeAdapterFactory(PARTITION_INFO_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(PARTITION_PERSIST_INFO_V_2_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(RECYCLE_PARTITION_INFO_V_2_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(TABLE_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(SNAPSHOT_INFO_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapterFactory(P_ENTRY_OBJECT_RUNTIME_TYPE_ADAPTER_FACTORY)
+            .registerTypeAdapter(LocalDateTime.class, LOCAL_DATE_TIME_TYPE_SERIALIZER)
+            .registerTypeAdapter(LocalDateTime.class, LOCAL_DATE_TIME_TYPE_DESERIALIZER)
+            .registerTypeAdapter(QueryDumpInfo.class, DUMP_INFO_SERIALIZER)
+            .registerTypeAdapter(QueryDumpInfo.class, DUMP_INFO_DESERIALIZER)
+            .registerTypeAdapter(HiveTableDumpInfo.class, HIVE_TABLE_DUMP_INFO_SERIALIZER)
+            .registerTypeAdapter(HiveTableDumpInfo.class, HIVE_TABLE_DUMP_INFO_DESERIALIZER)
+            .registerTypeAdapter(PrimitiveType.class, PRIMITIVE_TYPE_DESERIALIZER)
+            .registerTypeHierarchyAdapter(Expr.class, EXPRESSION_SERIALIZER)
+            .registerTypeHierarchyAdapter(Expr.class, EXPRESSION_DESERIALIZER);
 
     // this instance is thread-safe.
     public static final Gson GSON = GSON_BUILDER.create();
@@ -305,10 +459,10 @@ public class GsonUtils {
     private static class GuavaMultimapAdapter<K, V>
             implements JsonSerializer<Multimap<K, V>>, JsonDeserializer<Multimap<K, V>> {
 
-        private static final Type asMapReturnType = getAsMapMethod().getGenericReturnType();
+        private static final Type AS_MAP_RETURN_TYPE = getAsMapMethod().getGenericReturnType();
 
         private static Type asMapType(Type multimapType) {
-            return com.google.common.reflect.TypeToken.of(multimapType).resolveType(asMapReturnType).getType();
+            return com.google.common.reflect.TypeToken.of(multimapType).resolveType(AS_MAP_RETURN_TYPE).getType();
         }
 
         private static Method getAsMapMethod() {
@@ -365,9 +519,9 @@ public class GsonUtils {
         }
     }
 
-    public static class PostProcessTypeAdapterFactory implements TypeAdapterFactory {
+    public static class ProcessHookTypeAdapterFactory implements TypeAdapterFactory {
 
-        public PostProcessTypeAdapterFactory() {
+        public ProcessHookTypeAdapterFactory() {
         }
 
         @Override
@@ -375,8 +529,11 @@ public class GsonUtils {
             TypeAdapter<T> delegate = gson.getDelegateAdapter(this, type);
 
             return new TypeAdapter<T>() {
-                public void write(JsonWriter out, T value) throws IOException {
-                    delegate.write(out, value);
+                public void write(JsonWriter out, T obj) throws IOException {
+                    if (obj instanceof GsonPreProcessable) {
+                        ((GsonPreProcessable) obj).gsonPreProcess();
+                    }
+                    delegate.write(out, obj);
                 }
 
                 public T read(JsonReader reader) throws IOException {
@@ -390,4 +547,34 @@ public class GsonUtils {
         }
     }
 
+    private static class PrimitiveTypeDeserializer implements JsonDeserializer<PrimitiveType> {
+        @Override
+        public PrimitiveType deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context)
+                throws JsonParseException {
+            try {
+                return PrimitiveType.valueOf(json.getAsJsonPrimitive().getAsString());
+            } catch (Throwable t) {
+                return PrimitiveType.INVALID_TYPE;
+            }
+        }
+    }
+
+    private static class ExpressionSerializer implements JsonSerializer<Expr> {
+        @Override
+        public JsonElement serialize(Expr expr, Type type, JsonSerializationContext context) {
+            JsonObject expressionJson = new JsonObject();
+            expressionJson.addProperty("expr", expr.toSql());
+            return expressionJson;
+        }
+    }
+
+    private static class ExpressionDeserializer implements JsonDeserializer<Expr> {
+        @Override
+        public Expr deserialize(JsonElement jsonElement, Type type, JsonDeserializationContext context)
+                throws JsonParseException {
+            JsonObject expressionObject = jsonElement.getAsJsonObject();
+            String expressionSql = expressionObject.get("expr").getAsString();
+            return SqlParser.parseSqlToExpr(expressionSql, SqlModeHelper.MODE_DEFAULT);
+        }
+    }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/MaterializedIndexMeta.java
 
@@ -21,34 +34,33 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.analysis.CreateMaterializedViewStmt;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.SqlParser;
-import com.starrocks.analysis.SqlScanner;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.common.util.SqlParserUtils;
 import com.starrocks.persist.gson.GsonPostProcessable;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.qe.OriginStatement;
-import com.starrocks.qe.SqlModeHelper;
+import com.starrocks.sql.common.MetaUtils;
 import com.starrocks.thrift.TStorageType;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.io.StringReader;
 import java.util.List;
 import java.util.Map;
 
 public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
+
     @SerializedName(value = "indexId")
     private long indexId;
     @SerializedName(value = "schema")
     private List<Column> schema = Lists.newArrayList();
+    @SerializedName(value = "sortKeyIdxes")
+    public List<Integer> sortKeyIdxes = Lists.newArrayList();
     @SerializedName(value = "schemaVersion")
     private int schemaVersion;
     @SerializedName(value = "schemaHash")
@@ -64,7 +76,7 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
 
     public MaterializedIndexMeta(long indexId, List<Column> schema, int schemaVersion, int schemaHash,
                                  short shortKeyColumnCount, TStorageType storageType, KeysType keysType,
-                                 OriginStatement defineStmt) {
+                                 OriginStatement defineStmt, List<Integer> sortKeyIdxes) {
         this.indexId = indexId;
         Preconditions.checkState(schema != null);
         Preconditions.checkState(schema.size() != 0);
@@ -77,6 +89,13 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
         Preconditions.checkState(keysType != null);
         this.keysType = keysType;
         this.defineStmt = defineStmt;
+        this.sortKeyIdxes = sortKeyIdxes;
+    }
+
+    public MaterializedIndexMeta(long indexId, List<Column> schema, int schemaVersion, int schemaHash,
+                                 short shortKeyColumnCount, TStorageType storageType, KeysType keysType,
+                                 OriginStatement defineStmt) {
+        this(indexId, schema, schemaVersion, schemaHash, shortKeyColumnCount, storageType, keysType, defineStmt, null);
     }
 
     public long getIndexId() {
@@ -99,6 +118,10 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
         return schema;
     }
 
+    public List<Integer> getSortKeyIdxes() {
+        return sortKeyIdxes;
+    }
+
     public int getSchemaHash() {
         return schemaHash;
     }
@@ -119,10 +142,12 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
         }
     }
 
-    private void setColumnsDefineExpr(Map<String, Expr> columnNameToDefineExpr) {
+    // The column names of the materialized view are all lowercase, but the column names may be uppercase
+    @VisibleForTesting
+    public void setColumnsDefineExpr(Map<String, Expr> columnNameToDefineExpr) {
         for (Map.Entry<String, Expr> entry : columnNameToDefineExpr.entrySet()) {
             for (Column column : schema) {
-                if (column.getName().equals(entry.getKey())) {
+                if (column.getName().equalsIgnoreCase(entry.getKey())) {
                     column.setDefineExpr(entry.getValue());
                     break;
                 }
@@ -137,6 +162,11 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
             }
         }
         return null;
+    }
+
+    @Override
+    public int hashCode() {
+        return Long.hashCode(indexId);
     }
 
     @Override
@@ -185,17 +215,7 @@ public class MaterializedIndexMeta implements Writable, GsonPostProcessable {
         if (defineStmt == null) {
             return;
         }
-        // parse the define stmt to schema
-        SqlParser parser = new SqlParser(new SqlScanner(new StringReader(defineStmt.originStmt),
-                SqlModeHelper.MODE_DEFAULT));
-        CreateMaterializedViewStmt stmt;
-        try {
-            stmt = (CreateMaterializedViewStmt) SqlParserUtils.getStmt(parser, defineStmt.idx);
-            Map<String, Expr> columnNameToDefineExpr = stmt.parseDefineExprWithoutAnalyze();
-            setColumnsDefineExpr(columnNameToDefineExpr);
-        } catch (Exception e) {
-            throw new IOException("error happens when parsing create materialized view stmt: " + defineStmt, e);
-        }
+        Map<String, Expr> columnNameToDefineExpr = MetaUtils.parseColumnNameToDefineExpr(defineStmt);
+        setColumnsDefineExpr(columnNameToDefineExpr);
     }
-
 }

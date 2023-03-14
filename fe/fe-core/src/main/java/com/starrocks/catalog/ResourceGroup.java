@@ -1,148 +1,275 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/ResourceGroup.java
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
 
 package com.starrocks.catalog;
 
-import com.google.common.collect.Maps;
-import com.starrocks.common.DdlException;
+import com.google.gson.annotations.SerializedName;
+import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.thrift.TResourceGroup;
-import com.starrocks.thrift.TResourceType;
+import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.thrift.TWorkGroup;
+import com.starrocks.thrift.TWorkGroupType;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.EnumMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
 
-// Resource group to contain
 public class ResourceGroup implements Writable {
-    private EnumMap<ResourceType, Integer> quotaByType;
+    public static final String GROUP_TYPE = "type";
+    public static final String USER = "user";
+    public static final String ROLE = "role";
+    public static final String QUERY_TYPE = "query_type";
+    public static final String SOURCE_IP = "source_ip";
+    public static final String DATABASES = "db";
+    public static final String CPU_CORE_LIMIT = "cpu_core_limit";
+    public static final String MEM_LIMIT = "mem_limit";
+    public static final String BIG_QUERY_MEM_LIMIT = "big_query_mem_limit";
+    public static final String BIG_QUERY_SCAN_ROWS_LIMIT = "big_query_scan_rows_limit";
+    public static final String BIG_QUERY_CPU_SECOND_LIMIT = "big_query_cpu_second_limit";
+    public static final String CONCURRENCY_LIMIT = "concurrency_limit";
+    public static final String DEFAULT_RESOURCE_GROUP_NAME = "default_wg";
 
-    // Used for readIn
-    private ResourceGroup() {
-        quotaByType = Maps.newEnumMap(ResourceType.class);
+    public static final ShowResultSetMetaData META_DATA =
+            ShowResultSetMetaData.builder()
+                    .addColumn(new Column("name", ScalarType.createVarchar(100)))
+                    .addColumn(new Column("id", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("cpu_core_limit", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("mem_limit", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("big_query_cpu_second_limit", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("big_query_scan_rows_limit", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("big_query_mem_limit", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("concurrency_limit", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("type", ScalarType.createVarchar(200)))
+                    .addColumn(new Column("classifiers", ScalarType.createVarchar(1024)))
+                    .build();
+    @SerializedName(value = "classifiers")
+    List<ResourceGroupClassifier> classifiers;
+    @SerializedName(value = "name")
+    private String name;
+    @SerializedName(value = "id")
+    private long id;
+    @SerializedName(value = "cpuCoreLimit")
+    private Integer cpuCoreLimit;
+    @SerializedName(value = "memLimit")
+    private Double memLimit;
+    @SerializedName(value = "bigQueryMemLimit")
+    private Long bigQueryMemLimit;
+    @SerializedName(value = "bigQueryScanRowsLimit")
+    private Long bigQueryScanRowsLimit;
+    @SerializedName(value = "bigQueryCpuSecondLimit")
+    private Long bigQueryCpuSecondLimit;
+    @SerializedName(value = "concurrencyLimit")
+    private Integer concurrencyLimit;
+    @SerializedName(value = "workGroupType")
+    private TWorkGroupType resourceGroupType;
+    @SerializedName(value = "version")
+    private long version;
+
+    public ResourceGroup() {
     }
 
-    private ResourceGroup(int cpuShare) {
-        quotaByType = Maps.newEnumMap(ResourceType.class);
-        quotaByType.put(ResourceType.CPU_SHARE, cpuShare);
+    public static ResourceGroup read(DataInput in) throws IOException {
+        String json = Text.readString(in);
+        return GsonUtils.GSON.fromJson(json, ResourceGroup.class);
     }
 
-    public ResourceGroup getCopiedResourceGroup() {
-        ResourceGroup resourceGroup = new ResourceGroup();
-        resourceGroup.quotaByType = Maps.newEnumMap(quotaByType);
-        return resourceGroup;
-    }
-
-    public void updateByDesc(String desc, int value) throws DdlException {
-        ResourceType type = ResourceType.fromDesc(desc);
-        if (type == null) {
-            throw new DdlException("Unknown resource type(" + desc + ")");
+    private List<String> showClassifier(ResourceGroupClassifier classifier) {
+        List<String> row = new ArrayList<>();
+        row.add(this.name);
+        row.add("" + this.id);
+        row.add("" + cpuCoreLimit);
+        row.add("" + (memLimit * 100) + "%");
+        if (bigQueryCpuSecondLimit != null) {
+            row.add("" + bigQueryCpuSecondLimit);
+        } else {
+            row.add("" + 0);
         }
-        if (type == ResourceType.CPU_SHARE || type == ResourceType.IO_SHARE) {
-            if (value < 100 || value > 1000) {
-                throw new DdlException("Value for resource type("
-                        + desc + ") has to be in [100, 1000]");
-            }
+        if (bigQueryScanRowsLimit != null) {
+            row.add("" + bigQueryScanRowsLimit);
+        } else {
+            row.add("" + 0);
         }
-        quotaByType.put(type, value);
-    }
-
-    public int getByDesc(String desc) throws DdlException {
-        ResourceType type = ResourceType.fromDesc(desc);
-        if (type == null) {
-            throw new DdlException("Unknown resource type(" + desc + ")");
+        if (bigQueryMemLimit != null) {
+            row.add("" + bigQueryMemLimit);
+        } else {
+            row.add("" + 0);
         }
-        return quotaByType.get(type);
+        row.add("" + concurrencyLimit);
+        row.add("" + resourceGroupType.name().substring("WG_".length()));
+        row.add(classifier.toString());
+        return row;
     }
 
-    public Map<ResourceType, Integer> getQuotaMap() {
-        return quotaByType;
+    public List<List<String>> showVisible(String user, List<String> activeRoles, String ip) {
+        return classifiers.stream().filter(c -> c.isVisible(user, activeRoles, ip))
+                .map(this::showClassifier).collect(Collectors.toList());
     }
 
-    public static Builder builder() {
-        return new Builder();
+    public long getVersion() {
+        return version;
     }
 
-    public TResourceGroup toThrift() {
-        TResourceGroup tgroup = new TResourceGroup();
-        for (EnumMap.Entry<ResourceType, Integer> entry : quotaByType.entrySet()) {
-            tgroup.putToResourceByType(entry.getKey().toThrift(), entry.getValue());
-        }
-        return tgroup;
-    }
-
-    @Override
-    public String toString() {
-        StringBuilder sb = new StringBuilder();
-        int idx = 0;
-        for (EnumMap.Entry<ResourceType, Integer> entry : quotaByType.entrySet()) {
-            if (idx++ != 0) {
-                sb.append(", ");
-            }
-            sb.append(entry.getKey().toString()).append(" = ").append(entry.getValue());
-        }
-        return sb.toString();
+    public void setVersion(long version) {
+        this.version = version;
     }
 
     @Override
     public void write(DataOutput out) throws IOException {
-        out.writeInt(quotaByType.size());
-        for (Map.Entry<ResourceType, Integer> entry : quotaByType.entrySet()) {
-            out.writeInt(entry.getKey().toThrift().getValue());
-            out.writeInt(entry.getValue());
-        }
+        Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
-    public void readFields(DataInput in) throws IOException {
-        int numResource = in.readInt();
-        for (int i = 0; i < numResource; ++i) {
-            int code = in.readInt();
-            int value = in.readInt();
-
-            quotaByType.put(ResourceType.fromThrift(TResourceType.findByValue(code)), value);
+    public List<List<String>> show() {
+        if (classifiers.isEmpty()) {
+            return Collections.singletonList(showClassifier(new ResourceGroupClassifier()));
         }
+        return classifiers.stream().map(this::showClassifier).collect(Collectors.toList());
     }
 
-    public static ResourceGroup readIn(DataInput in) throws IOException {
-        ResourceGroup group = new ResourceGroup();
-        group.readFields(in);
-        return group;
+    public String getName() {
+        return name;
     }
 
-    public static class Builder {
-        private int cpuShare;
+    public void setName(String name) {
+        this.name = name;
+    }
 
-        public Builder() {
-            cpuShare = ResourceType.CPU_SHARE.getDefaultValue();
+    public long getId() {
+        return id;
+    }
+
+    public void setId(long id) {
+        this.id = id;
+    }
+
+    public TWorkGroup toThrift() {
+        TWorkGroup twg = new TWorkGroup();
+        twg.setName(name);
+        twg.setId(id);
+        if (cpuCoreLimit != null) {
+            twg.setCpu_core_limit(cpuCoreLimit);
+        }
+        if (memLimit != null) {
+            twg.setMem_limit(memLimit);
         }
 
-        public ResourceGroup build() {
-            return new ResourceGroup(cpuShare);
+        if (bigQueryMemLimit != null) {
+            twg.setBig_query_mem_limit(bigQueryMemLimit);
         }
 
-        public Builder cpuShare(int share) {
-            this.cpuShare = share;
-            return this;
+        if (bigQueryScanRowsLimit != null) {
+            twg.setBig_query_scan_rows_limit(bigQueryScanRowsLimit);
         }
+
+        if (bigQueryCpuSecondLimit != null) {
+            twg.setBig_query_cpu_second_limit(bigQueryCpuSecondLimit);
+        }
+
+        if (concurrencyLimit != null) {
+            twg.setConcurrency_limit(concurrencyLimit);
+        }
+        if (resourceGroupType != null) {
+            twg.setWorkgroup_type(resourceGroupType);
+        }
+        twg.setVersion(version);
+        return twg;
+    }
+
+    public Integer getCpuCoreLimit() {
+        return cpuCoreLimit;
+    }
+
+    public void setCpuCoreLimit(int cpuCoreLimit) {
+        this.cpuCoreLimit = cpuCoreLimit;
+    }
+
+    public Double getMemLimit() {
+        return memLimit;
+    }
+
+    public void setMemLimit(double memLimit) {
+        this.memLimit = memLimit;
+    }
+
+    public Long getBigQueryMemLimit() {
+        return bigQueryMemLimit;
+    }
+
+    public void setBigQueryMemLimit(long limit) {
+        bigQueryMemLimit = limit;
+    }
+
+    public Long getBigQueryScanRowsLimit() {
+        return bigQueryScanRowsLimit;
+    }
+
+    public void setBigQueryScanRowsLimit(long limit) {
+        bigQueryScanRowsLimit = limit;
+    }
+
+    public Long getBigQueryCpuSecondLimit() {
+        return bigQueryCpuSecondLimit;
+    }
+
+    public void setBigQueryCpuSecondLimit(long limit) {
+        bigQueryCpuSecondLimit = limit;
+    }
+
+    public Integer getConcurrencyLimit() {
+        return concurrencyLimit;
+    }
+
+    public void setConcurrencyLimit(int concurrencyLimit) {
+        this.concurrencyLimit = concurrencyLimit;
+    }
+
+    public TWorkGroupType getResourceGroupType() {
+        return resourceGroupType;
+    }
+
+    public void setResourceGroupType(TWorkGroupType workGroupType) {
+        this.resourceGroupType = workGroupType;
+    }
+
+    public List<ResourceGroupClassifier> getClassifiers() {
+        return classifiers;
+    }
+
+    public void setClassifiers(List<ResourceGroupClassifier> classifiers) {
+        this.classifiers = classifiers;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        ResourceGroup resourceGroup = (ResourceGroup) o;
+        return id == resourceGroup.id && version == resourceGroup.version;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id, version);
     }
 }

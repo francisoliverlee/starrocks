@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/AuditLog.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -29,6 +25,7 @@ public class AuditLog {
 
     public static final AuditLog SLOW_AUDIT = new AuditLog("audit.slow_query");
     public static final AuditLog QUERY_AUDIT = new AuditLog("audit.query");
+    public static final AuditLog BIG_QUERY_AUDIT = new AuditLog("big_query.query");
 
     private Logger logger;
 
@@ -38,6 +35,10 @@ public class AuditLog {
 
     public static AuditLog getSlowAudit() {
         return SLOW_AUDIT;
+    }
+
+    public static AuditLog getBigQueryAudit() {
+        return BIG_QUERY_AUDIT;
     }
 
     public AuditLog(String auditName) {

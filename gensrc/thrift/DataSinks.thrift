@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/DataSinks.thrift
 
@@ -35,13 +48,23 @@ enum TDataSinkType {
     MYSQL_TABLE_SINK,
     EXPORT_SINK,
     OLAP_TABLE_SINK,
-    MEMORY_SCRATCH_SINK
+    MEMORY_SCRATCH_SINK,
+    MULTI_CAST_DATA_STREAM_SINK,
+    SCHEMA_TABLE_SINK
 }
 
 enum TResultSinkType {
     MYSQL_PROTOCAL,
     FILE,
-    STATISTIC
+    STATISTIC,
+    VARIABLE
+}
+
+struct TParquetOptions {
+    // parquet row group max size in bytes
+    1: optional i64 parquet_max_group_bytes
+    2: optional Types.TCompressionType compression_type
+    3: optional bool use_dict
 }
 
 struct TResultFileSinkOptions {
@@ -51,11 +74,32 @@ struct TResultFileSinkOptions {
     4: optional string row_delimiter  // only for csv
     5: optional i64 max_file_size_bytes
     6: optional list<Types.TNetworkAddress> broker_addresses; // only for remote file
-    7: optional map<string, string> broker_properties // only for remote file
+    7: optional map<string, string> broker_properties // only for remote file.
+    // If use_broker is set, we will write hdfs thourgh broker
+    // If use_broker is not set, we will write through libhdfs/S3 directly
+    8: optional bool use_broker
+    // hdfs_write_buffer_size_kb for writing through lib hdfs directly
+    9: optional i32 hdfs_write_buffer_size_kb = 0
+    // properties from hdfs-site.xml, core-site.xml and load_properties
+    10: optional PlanNodes.THdfsProperties hdfs_properties
+    11: optional TParquetOptions parquet_options
+    12: optional list<string> file_column_names
 }
 
 struct TMemoryScratchSink {
 
+}
+
+// Specification of one output destination of a plan fragment
+struct TPlanFragmentDestination {
+  // the globally unique fragment instance id
+  1: required Types.TUniqueId fragment_instance_id
+
+  // ... which is being executed on this server
+  2: required Types.TNetworkAddress server
+  3: optional Types.TNetworkAddress brpc_server
+
+  4: optional i32 pipeline_driver_sequence
 }
 
 // Sink which forwards data to a remote plan fragment,
@@ -71,6 +115,25 @@ struct TDataStreamSink {
   2: required Partitions.TDataPartition output_partition
 
   3: optional bool ignore_not_found
+
+  // Only useful in pipeline mode
+  // If receiver side is ExchangeMergeSortSourceOperator, then all the
+  // packets should be kept in order (according sequence), so the sender
+  // side need to maintain a send window in order to avoiding the receiver
+  // buffer too many out-of-order packets
+  4: optional bool is_merge
+
+  // degree of paralleliasm of destination
+  // only used in pipeline engine
+  5: optional i32 dest_dop
+
+  // Specify the columns which need to send
+  6: optional list<i32> output_columns;
+}
+
+struct TMultiCastDataStreamSink {
+    1: required list<TDataStreamSink> sinks;
+    2: required list< list<TPlanFragmentDestination> > destinations;
 }
 
 struct TResultSink {
@@ -96,6 +159,14 @@ struct TExportSink {
     5: optional list<Types.TNetworkAddress> broker_addresses
     6: optional map<string, string> properties
 
+    // If use_broker is set, we will write hdfs thourgh broker
+    // If use_broker is not set, we will write through libhdfs/S3 directly
+    7: optional bool use_broker
+    // hdfs_write_buffer_size_kb for writing through lib hdfs directly
+    8: optional i32 hdfs_write_buffer_size_kb = 0
+    // properties from hdfs-site.xml, core-site.xml and load_properties
+    9: optional PlanNodes.THdfsProperties hdfs_properties
+
     // export file name prefix
     30: optional string file_name_prefix
 }
@@ -115,6 +186,21 @@ struct TOlapTableSink {
     12: required Descriptors.TOlapTableLocationParam location
     13: required Descriptors.TNodesInfo nodes_info
     14: optional i64 load_channel_timeout_s // the timeout of load channels in second
+    15: optional bool is_lake_table
+    16: optional string txn_trace_parent
+    17: optional Types.TKeysType keys_type
+    18: optional Types.TWriteQuorumType write_quorum_type
+    19: optional bool enable_replicated_storage
+    20: optional string merge_condition
+    21: optional bool null_expr_in_auto_increment
+    22: optional bool miss_auto_increment_column
+    23: optional bool abort_delete
+    24: optional i32 auto_increment_slot_id;
+}
+
+struct TSchemaTableSink {
+    1: optional string table
+    2: optional Descriptors.TNodesInfo nodes_info
 }
 
 struct TDataSink {
@@ -125,5 +211,6 @@ struct TDataSink {
   6: optional TExportSink export_sink
   7: optional TOlapTableSink olap_table_sink
   8: optional TMemoryScratchSink memory_scratch_sink
+  9: optional TMultiCastDataStreamSink multi_cast_stream_sink
+  10: optional TSchemaTableSink schema_table_sink
 }
-

@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rewrite;
 
@@ -7,12 +20,13 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.rewrite.FEFunction;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
@@ -27,6 +41,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Use for execute constant functions
@@ -52,13 +67,13 @@ public enum ScalarOperatorEvaluator {
 
         Class<?> clazz = ScalarOperatorFunctions.class;
         for (Method method : clazz.getDeclaredMethods()) {
-            FEFunction annotation = method.getAnnotation(FEFunction.class);
+            ConstantFunction annotation = method.getAnnotation(ConstantFunction.class);
             registerFunction(mapBuilder, method, annotation);
 
-            FEFunction.List listAnnotation = method.getAnnotation(FEFunction.List.class);
+            ConstantFunction.List listAnnotation = method.getAnnotation(ConstantFunction.List.class);
 
             if (listAnnotation != null) {
-                for (FEFunction f : listAnnotation.list()) {
+                for (ConstantFunction f : listAnnotation.list()) {
                     registerFunction(mapBuilder, method, f);
                 }
             }
@@ -67,12 +82,12 @@ public enum ScalarOperatorEvaluator {
     }
 
     private void registerFunction(ImmutableMap.Builder<FunctionSignature, FunctionInvoker> mapBuilder,
-                                  Method method, FEFunction annotation) {
+                                  Method method, ConstantFunction annotation) {
         if (annotation != null) {
             String name = annotation.name().toUpperCase();
             Type returnType = ScalarType.createType(annotation.returnType());
             List<Type> argTypes = new ArrayList<>();
-            for (String type : annotation.argTypes()) {
+            for (PrimitiveType type : annotation.argTypes()) {
                 argTypes.add(ScalarType.createType(type));
             }
 
@@ -101,10 +116,13 @@ public enum ScalarOperatorEvaluator {
 
         // return Null directly iff:
         // 1. Not UDF
-        // 2. Not in NonNullResultWithNullParamFunctions
+        // 2. Not in isNotAlwaysNullResultWithNullParamFunctions
         // 3. Has null parameter
-        if (!Catalog.getCurrentCatalog().isNonNullResultWithNullParamFunction(fn.getFunctionName().getFunction())
-                && !fn.isUdf()) {
+        // 4. Not assert_true
+        if (!GlobalStateMgr.getCurrentState()
+                .isNotAlwaysNullResultWithNullParamFunction(fn.getFunctionName().getFunction())
+                && !fn.isUdf()
+                && !FunctionSet.ASSERT_TRUE.equals(fn.getFunctionName().getFunction())) {
             for (ScalarOperator op : root.getChildren()) {
                 if (((ConstantOperator) op).isNull()) {
                     // Should return ConstantOperator.createNull(fn.getReturnType()),
@@ -133,7 +151,16 @@ public enum ScalarOperatorEvaluator {
         FunctionInvoker invoker = functions.get(signature);
 
         try {
-            return invoker.invoke(root.getChildren());
+            ConstantOperator operator = invoker.invoke(root.getChildren());
+
+            // check return result type, decimal will change return type
+            if (operator.getType().getPrimitiveType() != fn.getReturnType().getPrimitiveType()) {
+                Preconditions.checkState(operator.getType().isDecimalOfAnyVersion());
+                Preconditions.checkState(fn.getReturnType().isDecimalOfAnyVersion());
+                operator.setType(fn.getReturnType());
+            }
+
+            return operator;
         } catch (AnalysisException e) {
             LOG.debug("failed to invoke", e);
         }
@@ -164,7 +191,7 @@ public enum ScalarOperatorEvaluator {
             try {
                 return (ConstantOperator) method.invoke(null, invokeArgs.toArray());
             } catch (InvocationTargetException | IllegalAccessException | IllegalArgumentException e) {
-                throw new AnalysisException(e.getLocalizedMessage());
+                throw new AnalysisException(e.getLocalizedMessage(), e);
             }
         }
 
@@ -241,14 +268,21 @@ public enum ScalarOperatorEvaluator {
             }
 
             ScalarOperatorEvaluator.FunctionSignature signature = (ScalarOperatorEvaluator.FunctionSignature) o;
-            return Objects.equals(name, signature.name)
-                    && argTypes.equals(signature.argTypes)
-                    && Objects.equals(returnType, signature.returnType);
+
+            List<PrimitiveType> primitiveTypes =
+                    argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+            List<PrimitiveType> sigPrimitiveTypes =
+                    signature.argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+            return Objects.equals(name, signature.name) &&
+                    primitiveTypes.equals(sigPrimitiveTypes) &&
+                    returnType.matchesType(signature.returnType);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(name, argTypes, returnType);
+            List<PrimitiveType> primitiveTypes =
+                    argTypes.stream().map(Type::getPrimitiveType).collect(Collectors.toList());
+            return Objects.hash(name, primitiveTypes, returnType.getPrimitiveType());
         }
     }
 }

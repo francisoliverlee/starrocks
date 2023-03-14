@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/common/PropertyAnalyzerTest.java
 
@@ -21,6 +34,7 @@
 
 package com.starrocks.common;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -31,11 +45,15 @@ import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.thrift.TCompressionType;
 import com.starrocks.thrift.TStorageMedium;
+import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.text.SimpleDateFormat;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,8 +73,18 @@ public class PropertyAnalyzerTest {
         Map<String, String> properties = Maps.newHashMap();
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k1");
 
-        Set<String> bfColumns = PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+        Set<String> bfColumns = PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         Assert.assertEquals(Sets.newHashSet("k1"), bfColumns);
+    }
+
+    private void assertBloomFilterNotSupport(Map<String, String> properties, List<Column> columns, String columnName) {
+        properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, columnName);
+        try {
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
+        } catch (AnalysisException e) {
+            Assert.assertTrue(e.getMessage(),
+                    e.getMessage().contains("Invalid bloom filter column '" + columnName + "'"));
+        }
     }
 
     @Test
@@ -67,6 +95,8 @@ public class PropertyAnalyzerTest {
         columns.add(new Column("k3", Type.BOOLEAN));
         columns.add(new Column("v1", Type.VARCHAR, false, AggregateType.REPLACE, "", ""));
         columns.add(new Column("v2", Type.BIGINT, false, AggregateType.SUM, "0", ""));
+        columns.add(new Column("kjson", Type.JSON));
+        columns.add(new Column("khll", Type.HLL));
         columns.get(0).setIsKey(true);
         columns.get(1).setIsKey(true);
 
@@ -75,7 +105,8 @@ public class PropertyAnalyzerTest {
         // no bf columns
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "");
         try {
-            Assert.assertEquals(Sets.newHashSet(), PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns));
+            Assert.assertEquals(Sets.newHashSet(),
+                    PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false));
         } catch (AnalysisException e) {
             Assert.fail();
         }
@@ -83,31 +114,21 @@ public class PropertyAnalyzerTest {
         // k4 not exist
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k4");
         try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         } catch (AnalysisException e) {
             Assert.assertTrue(e.getMessage().contains("Invalid bloom filter column 'k4'"));
         }
 
-        // tinyint not supported
-        properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k2");
-        try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
-        } catch (AnalysisException e) {
-            Assert.assertTrue(e.getMessage().contains("Invalid bloom filter column 'k2'"));
-        }
-
-        // bool not supported
-        properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k3");
-        try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
-        } catch (AnalysisException e) {
-            Assert.assertTrue(e.getMessage().contains("Invalid bloom filter column 'k3'"));
-        }
+        // not supported
+        assertBloomFilterNotSupport(properties, columns, "k2");
+        assertBloomFilterNotSupport(properties, columns, "k3");
+        assertBloomFilterNotSupport(properties, columns, "kjson");
+        assertBloomFilterNotSupport(properties, columns, "khll");
 
         // not replace value
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "v2");
         try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         } catch (AnalysisException e) {
             Assert.assertTrue(e.getMessage().contains("Bloom filter index only used in"));
         }
@@ -115,7 +136,7 @@ public class PropertyAnalyzerTest {
         // reduplicated column
         properties.put(PropertyAnalyzer.PROPERTIES_BF_COLUMNS, "k1,K1");
         try {
-            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns);
+            PropertyAnalyzer.analyzeBloomFilterColumns(properties, columns, false);
         } catch (AnalysisException e) {
             Assert.assertTrue(e.getMessage().contains("Duplicate bloom filter column 'K1'"));
         }
@@ -135,11 +156,65 @@ public class PropertyAnalyzerTest {
 
         Map<String, String> properties = Maps.newHashMap();
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_COLDOWN_TIME, tomorrowTimeStr);
+        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_COOLDOWN_TIME, tomorrowTimeStr);
         DataProperty dataProperty =
                 PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.SSD));
         // avoid UT fail because time zone different
         DateLiteral dateLiteral = new DateLiteral(tomorrowTimeStr, Type.DATETIME);
         Assert.assertEquals(dateLiteral.unixTimestamp(TimeUtils.getTimeZone()), dataProperty.getCooldownTimeMs());
+    }
+
+    @Test
+    public void testCoolDownTime() throws AnalysisException {
+        Map<String, String> properties1 = Maps.newHashMap();
+        properties1.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
+        DataProperty dataProperty =
+                PropertyAnalyzer.analyzeDataProperty(properties1, new DataProperty(TStorageMedium.SSD));
+        // Cooldown is disabled(with maximum cooldown timestamp) by default
+        Assert.assertEquals(DataProperty.MAX_COOLDOWN_TIME_MS, dataProperty.getCooldownTimeMs());
+
+        Config.tablet_sched_storage_cooldown_second = -2;
+        Map<String, String> properties2 = Maps.newHashMap();
+        properties2.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
+        dataProperty =
+                PropertyAnalyzer.analyzeDataProperty(properties2, new DataProperty(TStorageMedium.SSD));
+        Assert.assertEquals(DataProperty.MAX_COOLDOWN_TIME_MS, dataProperty.getCooldownTimeMs());
+
+        Config.tablet_sched_storage_cooldown_second = 253402271999L;
+        Map<String, String> properties3 = Maps.newHashMap();
+        properties3.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
+        dataProperty =
+                PropertyAnalyzer.analyzeDataProperty(properties3, new DataProperty(TStorageMedium.SSD));
+        Assert.assertEquals(DataProperty.MAX_COOLDOWN_TIME_MS, dataProperty.getCooldownTimeMs());
+
+        Map<String, String> properties4 = Maps.newHashMap();
+        properties4.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
+        Config.tablet_sched_storage_cooldown_second = 600;
+        long start = System.currentTimeMillis();
+        dataProperty =
+                PropertyAnalyzer.analyzeDataProperty(properties4, new DataProperty(TStorageMedium.SSD));
+        long end = System.currentTimeMillis();
+        Assert.assertTrue(dataProperty.getCooldownTimeMs() >= start + 600 * 1000L &&
+                dataProperty.getCooldownTimeMs() <= end + 600 * 1000L);
+    }
+
+    @Test
+    public void testDefaultTableCompression() throws AnalysisException {
+        // No session
+        Assert.assertEquals(TCompressionType.LZ4_FRAME, (PropertyAnalyzer.analyzeCompressionType(ImmutableMap.of())));
+
+        // Default in the session
+        ConnectContext ctx = UtFrameUtils.createDefaultCtx();
+        ctx.setThreadLocalInfo();
+        Assert.assertEquals(TCompressionType.LZ4_FRAME, (PropertyAnalyzer.analyzeCompressionType(ImmutableMap.of())));
+
+        // Set in the session
+        ctx.getSessionVariable().setDefaultTableCompression("zstd");
+        Assert.assertEquals(TCompressionType.ZSTD, (PropertyAnalyzer.analyzeCompressionType(ImmutableMap.of())));
+
+        // Set in the property
+        Map<String, String> property = new HashMap<>();
+        property.put(PropertyAnalyzer.PROPERTIES_COMPRESSION, "zlib");
+        Assert.assertEquals(TCompressionType.ZLIB, (PropertyAnalyzer.analyzeCompressionType(property)));
     }
 }

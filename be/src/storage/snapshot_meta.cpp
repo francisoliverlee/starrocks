@@ -1,13 +1,34 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/snapshot_meta.h"
 
-#include "env/output_stream_wrapper.h"
+#include "fs/output_stream_wrapper.h"
 #include "gutil/endian.h"
 #include "util/coding.h"
 #include "util/raw_container.h"
 
 namespace starrocks {
+
+Status SnapshotMeta::serialize_to_file(const std::string& file_path) {
+    std::unique_ptr<WritableFile> f;
+    WritableFileOptions opts{.sync_on_close = true, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
+    ASSIGN_OR_RETURN(f, FileSystem::Default()->new_writable_file(opts, file_path));
+    RETURN_IF_ERROR(serialize_to_file(f.get()));
+    RETURN_IF_ERROR(f->close());
+    return Status::OK();
+}
 
 //
 // File format of snapshot meta.
@@ -38,9 +59,9 @@ Status SnapshotMeta::serialize_to_file(WritableFile* file) {
     footer.set_format_version(_format_version);
     footer.set_snapshot_type(_snapshot_type);
     footer.set_snapshot_version(_snapshot_version);
-    for (const auto& m : _rowset_metas) {
+    for (const auto& rowset_meta : _rowset_metas) {
         footer.add_rowset_meta_offsets(static_cast<int64_t>(stream.size()));
-        if (!m.SerializeToOstream(&stream)) {
+        if (!rowset_meta.SerializeToOstream(&stream)) {
             return Status::IOError("fail to serialize rowset meta to file");
         }
     }
@@ -63,7 +84,7 @@ Status SnapshotMeta::serialize_to_file(WritableFile* file) {
         return Status::IOError("fail to serialize tablet meta to file");
     }
 
-    int64_t footer_offset = static_cast<int64_t>(stream.size());
+    auto footer_offset = static_cast<int64_t>(stream.size());
     if (!footer.SerializeToOstream(&stream)) {
         return Status::IOError("fail to serialize footer to file");
     }
@@ -77,15 +98,14 @@ Status SnapshotMeta::serialize_to_file(WritableFile* file) {
 }
 
 Status SnapshotMeta::parse_from_file(RandomAccessFile* file) {
-    uint64_t file_length = 0;
-    RETURN_IF_ERROR(file->size(&file_length));
+    ASSIGN_OR_RETURN(const uint64_t file_length, file->get_size());
     if (file_length < 16) {
         return Status::InvalidArgument("snapshot meta file too short");
     }
     std::string buff;
     raw::stl_string_resize_uninitialized(&buff, 16);
 
-    RETURN_IF_ERROR(file->read_at(file_length - 16, buff));
+    RETURN_IF_ERROR(file->read_at_fully(file_length - 16, buff.data(), buff.size()));
     // Parse SnapshotMetaFooterPB
     auto footer_limit = static_cast<int64_t>(file_length) - 16;
     auto footer_offset = static_cast<int64_t>(BigEndian::ToHost64(UNALIGNED_LOAD64(buff.data())));
@@ -97,7 +117,7 @@ Status SnapshotMeta::parse_from_file(RandomAccessFile* file) {
         return Status::Corruption("invalid footer offset");
     }
     raw::stl_string_resize_uninitialized(&buff, footer_limit - footer_offset);
-    RETURN_IF_ERROR(file->read_at(footer_offset, buff));
+    RETURN_IF_ERROR(file->read_at_fully(footer_offset, buff.data(), buff.size()));
     SnapshotMetaFooterPB footer;
     if (!footer.ParseFromString(buff)) {
         return Status::Corruption("parse snapshot meta footer failed");
@@ -138,7 +158,7 @@ Status SnapshotMeta::parse_from_file(RandomAccessFile* file) {
         auto start = footer.rowset_meta_offsets(i);
         auto end = footer.rowset_meta_offsets(i + 1);
         raw::stl_string_resize_uninitialized(&buff, end - start);
-        RETURN_IF_ERROR(file->read_at(start, buff));
+        RETURN_IF_ERROR(file->read_at_fully(start, buff.data(), buff.size()));
         if (!_rowset_metas[i].ParseFromString(buff)) {
             return Status::InternalError("parse rowset meta failed");
         }
@@ -152,7 +172,7 @@ Status SnapshotMeta::parse_from_file(RandomAccessFile* file) {
         auto start = footer.delvec_offsets(i);
         auto end = footer.delvec_offsets(i + 1);
         raw::stl_string_resize_uninitialized(&buff, end - start);
-        RETURN_IF_ERROR(file->read_at(start, buff));
+        RETURN_IF_ERROR(file->read_at_fully(start, buff.data(), buff.size()));
         DelVector delvec;
         RETURN_IF_ERROR(delvec.load(version, buff.data(), buff.size()));
         (void)_delete_vectors.emplace(static_cast<uint32_t>(segment_id), std::move(delvec));
@@ -166,7 +186,7 @@ Status SnapshotMeta::parse_from_file(RandomAccessFile* file) {
     // Tablet meta
     auto tablet_meta_offset = footer.tablet_meta_offset();
     raw::stl_string_resize_uninitialized(&buff, footer_offset - tablet_meta_offset);
-    RETURN_IF_ERROR(file->read_at(tablet_meta_offset, buff));
+    RETURN_IF_ERROR(file->read_at_fully(tablet_meta_offset, buff.data(), buff.size()));
     if (!_tablet_meta.ParseFromString(buff)) {
         return Status::InternalError("parse tablet meta failed");
     }

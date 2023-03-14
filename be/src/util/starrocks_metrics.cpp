@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/starrocks_metrics.cpp
 
@@ -21,12 +34,10 @@
 
 #include "util/starrocks_metrics.h"
 
-#include <sys/types.h>
 #include <unistd.h>
 
-#include "env/env.h"
+#include "fs/fs.h"
 #include "util/debug_util.h"
-#include "util/file_utils.h"
 #include "util/system_metrics.h"
 
 namespace starrocks {
@@ -165,11 +176,14 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_STARROCKS_METRIC(max_network_send_bytes_rate);
     REGISTER_STARROCKS_METRIC(max_network_receive_bytes_rate);
 
+#ifndef USE_JEMALLOC
     REGISTER_STARROCKS_METRIC(tcmalloc_total_bytes_reserved);
     REGISTER_STARROCKS_METRIC(tcmalloc_pageheap_unmapped_bytes);
     REGISTER_STARROCKS_METRIC(tcmalloc_bytes_in_use);
+#else
+#endif
 
-    _metrics.register_hook(_s_hook_name, std::bind(&StarRocksMetrics::_update, this));
+    _metrics.register_hook(_s_hook_name, [this] { _update(); });
 
     REGISTER_STARROCKS_METRIC(readable_blocks_total);
     REGISTER_STARROCKS_METRIC(writable_blocks_total);
@@ -215,7 +229,10 @@ void StarRocksMetrics::_update_process_thread_num() {
     ss << "/proc/" << pid << "/task/";
 
     int64_t count = 0;
-    Status st = FileUtils::get_children_count(Env::Default(), ss.str(), &count);
+    auto st = FileSystem::Default()->iterate_dir(ss.str(), [&](std::string_view /*name*/) {
+        count++;
+        return true;
+    });
     if (!st.ok()) {
         LOG(WARNING) << "failed to count thread num from: " << ss.str();
         process_thread_num.set_value(0);
@@ -233,7 +250,10 @@ void StarRocksMetrics::_update_process_fd_num() {
     std::stringstream ss;
     ss << "/proc/" << pid << "/fd/";
     int64_t count = 0;
-    Status st = FileUtils::get_children_count(Env::Default(), ss.str(), &count);
+    auto st = FileSystem::Default()->iterate_dir(ss.str(), [&](std::string_view) {
+        count++;
+        return true;
+    });
     if (!st.ok()) {
         LOG(WARNING) << "failed to count fd from: " << ss.str();
         process_fd_num_used.set_value(0);

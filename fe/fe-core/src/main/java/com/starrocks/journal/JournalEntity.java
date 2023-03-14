@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/journal/JournalEntity.java
 
@@ -22,27 +35,26 @@
 package com.starrocks.journal;
 
 import com.google.common.base.Preconditions;
-import com.starrocks.alter.AlterJob;
 import com.starrocks.alter.AlterJobV2;
 import com.starrocks.alter.BatchAlterJobPersistInfo;
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.backup.BackupJob;
+import com.starrocks.authentication.UserPropertyInfo;
+import com.starrocks.backup.AbstractJob;
 import com.starrocks.backup.Repository;
-import com.starrocks.backup.RestoreJob;
 import com.starrocks.catalog.BrokerMgr;
+import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSearchDesc;
 import com.starrocks.catalog.MetaVersion;
 import com.starrocks.catalog.Resource;
-import com.starrocks.cluster.BaseParam;
 import com.starrocks.cluster.Cluster;
 import com.starrocks.common.Config;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.SmallFileMgr.SmallFile;
-import com.starrocks.ha.MasterInfo;
+import com.starrocks.ha.LeaderInfo;
 import com.starrocks.journal.bdbje.Timestamp;
+import com.starrocks.leader.Checkpoint;
 import com.starrocks.load.DeleteInfo;
 import com.starrocks.load.ExportJob;
 import com.starrocks.load.LoadErrorHub;
@@ -50,48 +62,84 @@ import com.starrocks.load.MultiDeleteInfo;
 import com.starrocks.load.loadv2.LoadJob.LoadJobStateUpdateInfo;
 import com.starrocks.load.loadv2.LoadJobFinalOperation;
 import com.starrocks.load.routineload.RoutineLoadJob;
-import com.starrocks.master.Checkpoint;
-import com.starrocks.mysql.privilege.UserPropertyInfo;
+import com.starrocks.load.streamload.StreamLoadTask;
 import com.starrocks.persist.AddPartitionsInfo;
+import com.starrocks.persist.AddPartitionsInfoV2;
+import com.starrocks.persist.AlterLoadJobOperationLog;
 import com.starrocks.persist.AlterRoutineLoadJobOperationLog;
+import com.starrocks.persist.AlterUserInfo;
 import com.starrocks.persist.AlterViewInfo;
+import com.starrocks.persist.AlterWhClusterOplog;
+import com.starrocks.persist.AlterWhPropertyOplog;
+import com.starrocks.persist.AuthUpgradeInfo;
+import com.starrocks.persist.AutoIncrementInfo;
 import com.starrocks.persist.BackendIdsUpdateInfo;
 import com.starrocks.persist.BackendTabletsInfo;
 import com.starrocks.persist.BatchDropInfo;
 import com.starrocks.persist.BatchModifyPartitionsInfo;
-import com.starrocks.persist.ClusterInfo;
+import com.starrocks.persist.ChangeMaterializedViewRefreshSchemeLog;
 import com.starrocks.persist.ColocatePersistInfo;
 import com.starrocks.persist.ConsistencyCheckInfo;
+import com.starrocks.persist.CreateInsertOverwriteJobLog;
 import com.starrocks.persist.CreateTableInfo;
+import com.starrocks.persist.CreateUserInfo;
 import com.starrocks.persist.DatabaseInfo;
+import com.starrocks.persist.DropCatalogLog;
+import com.starrocks.persist.DropComputeNodeLog;
 import com.starrocks.persist.DropDbInfo;
 import com.starrocks.persist.DropInfo;
-import com.starrocks.persist.DropLinkDbAndUpdateDbInfo;
 import com.starrocks.persist.DropPartitionInfo;
 import com.starrocks.persist.DropResourceOperationLog;
 import com.starrocks.persist.GlobalVarPersistInfo;
 import com.starrocks.persist.HbPackage;
+import com.starrocks.persist.ImpersonatePrivInfo;
+import com.starrocks.persist.InsertOverwriteStateChangeInfo;
 import com.starrocks.persist.ModifyPartitionInfo;
+import com.starrocks.persist.ModifyTableColumnOperationLog;
 import com.starrocks.persist.ModifyTablePropertyOperationLog;
+import com.starrocks.persist.MultiEraseTableInfo;
+import com.starrocks.persist.OpWarehouseLog;
 import com.starrocks.persist.OperationType;
 import com.starrocks.persist.PartitionPersistInfo;
+import com.starrocks.persist.PartitionPersistInfoV2;
 import com.starrocks.persist.PrivInfo;
 import com.starrocks.persist.RecoverInfo;
 import com.starrocks.persist.RemoveAlterJobV2OperationLog;
+import com.starrocks.persist.RenameMaterializedViewLog;
 import com.starrocks.persist.ReplacePartitionOperationLog;
 import com.starrocks.persist.ReplicaPersistInfo;
+import com.starrocks.persist.ResourceGroupOpEntry;
+import com.starrocks.persist.ResumeWarehouseLog;
+import com.starrocks.persist.RolePrivilegeCollectionInfo;
 import com.starrocks.persist.RoutineLoadOperation;
 import com.starrocks.persist.SetReplicaStatusOperationLog;
+import com.starrocks.persist.ShardInfo;
 import com.starrocks.persist.SwapTableOperationLog;
 import com.starrocks.persist.TableInfo;
 import com.starrocks.persist.TablePropertyInfo;
 import com.starrocks.persist.TruncateTableInfo;
+import com.starrocks.persist.UserPrivilegeCollectionInfo;
 import com.starrocks.plugin.PluginInfo;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.scheduler.Task;
+import com.starrocks.scheduler.mv.MVEpoch;
+import com.starrocks.scheduler.mv.MVMaintenanceJob;
+import com.starrocks.scheduler.persist.DropTaskRunsLog;
+import com.starrocks.scheduler.persist.DropTasksLog;
+import com.starrocks.scheduler.persist.TaskRunPeriodStatusChange;
+import com.starrocks.scheduler.persist.TaskRunStatus;
+import com.starrocks.scheduler.persist.TaskRunStatusChange;
+import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.staros.StarMgrJournal;
 import com.starrocks.statistic.AnalyzeJob;
+import com.starrocks.statistic.AnalyzeStatus;
+import com.starrocks.statistic.BasicStatsMeta;
+import com.starrocks.statistic.HistogramStatsMeta;
 import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.system.Frontend;
 import com.starrocks.transaction.TransactionState;
+import com.starrocks.warehouse.Warehouse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -139,15 +187,48 @@ public class JournalEntity implements Writable {
         boolean isRead = false;
         LOG.debug("get opcode: {}", opCode);
         switch (opCode) {
-            case OperationType.OP_SAVE_NEXTID: {
+            case OperationType.OP_SAVE_NEXTID:
+            case OperationType.OP_SAVE_TRANSACTION_ID:
+            case OperationType.OP_ERASE_DB:
+            case OperationType.OP_ERASE_TABLE:
+            case OperationType.OP_ERASE_PARTITION:
+            case OperationType.OP_META_VERSION:
+            case OperationType.OP_DROP_ALL_BROKER:
+            case OperationType.OP_DROP_REPOSITORY: {
                 data = new Text();
                 ((Text) data).readFields(in);
                 isRead = true;
                 break;
             }
-            case OperationType.OP_SAVE_TRANSACTION_ID: {
-                data = new Text();
-                ((Text) data).readFields(in);
+            case OperationType.OP_CREATE_WH: {
+                data = Warehouse.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_SUSPEND_WH:
+            case OperationType.OP_DROP_WH: {
+                data = OpWarehouseLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_RESUME_WH: {
+                data = ResumeWarehouseLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ALTER_WH_ADD_CLUSTER:
+            case OperationType.OP_ALTER_WH_REMOVE_CLUSTER: {
+                data = AlterWhClusterOplog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ALTER_WH_MOD_PROP: {
+                data = AlterWhPropertyOplog.read(in);
+            }
+            case OperationType.OP_SAVE_AUTO_INCREMENT_ID:
+            case OperationType.OP_DELETE_AUTO_INCREMENT_ID: {
+                data = new AutoIncrementInfo(null);
+                ((AutoIncrementInfo) data).read(in);
                 isRead = true;
                 break;
             }
@@ -169,15 +250,27 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_CREATE_MATERIALIZED_VIEW:
             case OperationType.OP_CREATE_TABLE: {
                 data = new CreateTableInfo();
                 ((CreateTableInfo) data).readFields(in);
                 isRead = true;
                 break;
             }
-            case OperationType.OP_DROP_TABLE: {
+            case OperationType.OP_DROP_TABLE:
+            case OperationType.OP_DROP_ROLLUP: {
                 data = new DropInfo();
                 ((DropInfo) data).readFields(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ERASE_MULTI_TABLES: {
+                data = MultiEraseTableInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ADD_PARTITION_V2: {
+                data = PartitionPersistInfoV2.read(in);
                 isRead = true;
                 break;
             }
@@ -189,6 +282,11 @@ public class JournalEntity implements Writable {
             }
             case OperationType.OP_ADD_PARTITIONS: {
                 data = AddPartitionsInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ADD_PARTITIONS_V2: {
+                data = AddPartitionsInfoV2.read(in);
                 isRead = true;
                 break;
             }
@@ -208,39 +306,11 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
-            case OperationType.OP_ERASE_DB:
-            case OperationType.OP_ERASE_TABLE:
-            case OperationType.OP_ERASE_PARTITION: {
-                data = new Text();
-                ((Text) data).readFields(in);
-                isRead = true;
-                break;
-            }
             case OperationType.OP_RECOVER_DB:
             case OperationType.OP_RECOVER_TABLE:
             case OperationType.OP_RECOVER_PARTITION: {
                 data = new RecoverInfo();
                 ((RecoverInfo) data).readFields(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_START_ROLLUP:
-            case OperationType.OP_FINISHING_ROLLUP:
-            case OperationType.OP_FINISHING_SCHEMA_CHANGE:
-            case OperationType.OP_FINISH_ROLLUP:
-            case OperationType.OP_CANCEL_ROLLUP:
-            case OperationType.OP_START_SCHEMA_CHANGE:
-            case OperationType.OP_FINISH_SCHEMA_CHANGE:
-            case OperationType.OP_CANCEL_SCHEMA_CHANGE:
-            case OperationType.OP_START_DECOMMISSION_BACKEND:
-            case OperationType.OP_FINISH_DECOMMISSION_BACKEND: {
-                data = AlterJob.read(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_DROP_ROLLUP: {
-                data = new DropInfo();
-                ((DropInfo) data).readFields(in);
                 isRead = true;
                 break;
             }
@@ -262,13 +332,25 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_CHANGE_MATERIALIZED_VIEW_REFRESH_SCHEME:
+                data = ChangeMaterializedViewRefreshSchemeLog.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_ALTER_MATERIALIZED_VIEW_PROPERTIES:
+                data = ModifyTablePropertyOperationLog.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_RENAME_MATERIALIZED_VIEW:
+                data = RenameMaterializedViewLog.read(in);
+                isRead = true;
+                break;
             case OperationType.OP_BACKUP_JOB: {
-                data = BackupJob.read(in);
+                data = AbstractJob.read(in);
                 isRead = true;
                 break;
             }
             case OperationType.OP_RESTORE_JOB: {
-                data = RestoreJob.read(in);
+                data = AbstractJob.read(in);
                 isRead = true;
                 break;
             }
@@ -286,6 +368,10 @@ public class JournalEntity implements Writable {
             case OperationType.OP_EXPORT_UPDATE_STATE:
                 data = new ExportJob.StateTransfer();
                 ((ExportJob.StateTransfer) data).readFields(in);
+                isRead = true;
+                break;
+            case OperationType.OP_EXPORT_UPDATE_INFO:
+                data = ExportJob.ExportUpdateInfo.read(in);
                 isRead = true;
                 break;
             case OperationType.OP_FINISH_DELETE:
@@ -314,8 +400,19 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_ADD_COMPUTE_NODE: {
+                data = ComputeNode.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_DROP_COMPUTE_NODE: {
+                data = DropComputeNodeLog.read(in);
+                isRead = true;
+                break;
+            }
             case OperationType.OP_ADD_FRONTEND:
             case OperationType.OP_ADD_FIRST_FRONTEND:
+            case OperationType.OP_UPDATE_FRONTEND:
             case OperationType.OP_REMOVE_FRONTEND: {
                 data = new Frontend();
                 ((Frontend) data).readFields(in);
@@ -338,7 +435,9 @@ public class JournalEntity implements Writable {
             case OperationType.OP_REVOKE_PRIV:
             case OperationType.OP_SET_PASSWORD:
             case OperationType.OP_CREATE_ROLE:
-            case OperationType.OP_DROP_ROLE: {
+            case OperationType.OP_DROP_ROLE:
+            case OperationType.OP_GRANT_ROLE:
+            case OperationType.OP_REVOKE_ROLE: {
                 data = PrivInfo.read(in);
                 isRead = true;
                 break;
@@ -348,22 +447,15 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
-            case OperationType.OP_MASTER_INFO_CHANGE: {
-                data = new MasterInfo();
-                ((MasterInfo) data).readFields(in);
+            case OperationType.OP_LEADER_INFO_CHANGE: {
+                data = new LeaderInfo();
+                ((LeaderInfo) data).readFields(in);
                 isRead = true;
                 break;
             }
             case OperationType.OP_TIMESTAMP: {
                 data = new Timestamp();
                 ((Timestamp) data).readFields(in);
-                isRead = true;
-                break;
-            }
-            //compatible with old community meta, newly added log using OP_META_VERSION_V2
-            case OperationType.OP_META_VERSION: {
-                data = new Text();
-                ((Text) data).readFields(in);
                 isRead = true;
                 break;
             }
@@ -383,42 +475,10 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
-            case OperationType.OP_DROP_CLUSTER:
-            case OperationType.OP_EXPAND_CLUSTER: {
-                data = new ClusterInfo();
-                ((ClusterInfo) data).readFields(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_LINK_CLUSTER:
-            case OperationType.OP_MIGRATE_CLUSTER: {
-                data = new BaseParam();
-                ((BaseParam) data).readFields(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_UPDATE_DB: {
-                data = new DatabaseInfo();
-                ((DatabaseInfo) data).readFields(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_DROP_LINKDB: {
-                data = new DropLinkDbAndUpdateDbInfo();
-                ((DropLinkDbAndUpdateDbInfo) data).readFields(in);
-                isRead = true;
-                break;
-            }
             case OperationType.OP_ADD_BROKER:
             case OperationType.OP_DROP_BROKER: {
                 data = new BrokerMgr.ModifyBrokerInfo();
                 ((BrokerMgr.ModifyBrokerInfo) data).readFields(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_DROP_ALL_BROKER: {
-                data = new Text();
-                ((Text) data).readFields(in);
                 isRead = true;
                 break;
             }
@@ -437,12 +497,6 @@ public class JournalEntity implements Writable {
             }
             case OperationType.OP_CREATE_REPOSITORY: {
                 data = Repository.read(in);
-                isRead = true;
-                break;
-            }
-            case OperationType.OP_DROP_REPOSITORY: {
-                data = new Text();
-                ((Text) data).readFields(in);
                 isRead = true;
                 break;
             }
@@ -472,6 +526,11 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_HEARTBEAT_V2: {
+                data = HbPackage.readV2(in);
+                isRead = true;
+                break;
+            }
             case OperationType.OP_ADD_FUNCTION: {
                 data = Function.read(in);
                 isRead = true;
@@ -495,6 +554,11 @@ public class JournalEntity implements Writable {
             case OperationType.OP_CHANGE_ROUTINE_LOAD_JOB:
             case OperationType.OP_REMOVE_ROUTINE_LOAD_JOB: {
                 data = RoutineLoadOperation.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_CREATE_STREAM_LOAD_TASK: {
+                data = StreamLoadTask.read(in);
                 isRead = true;
                 break;
             }
@@ -523,6 +587,36 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_RESOURCE_GROUP: {
+                data = ResourceGroupOpEntry.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_CREATE_TASK:
+                data = Task.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_DROP_TASKS:
+                data = DropTasksLog.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_CREATE_TASK_RUN:
+                data = TaskRunStatus.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_UPDATE_TASK_RUN:
+                data = TaskRunStatusChange.read(in);
+                isRead = true;
+                break;
+            // only update the progress of task run
+            case OperationType.OP_UPDATE_TASK_RUN_STATE:
+                data = TaskRunPeriodStatusChange.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_DROP_TASK_RUNS:
+                data = DropTaskRunsLog.read(in);
+                isRead = true;
+                break;
             case OperationType.OP_CREATE_SMALL_FILE:
             case OperationType.OP_DROP_SMALL_FILE: {
                 data = SmallFile.read(in);
@@ -551,7 +645,15 @@ public class JournalEntity implements Writable {
             }
             case OperationType.OP_DYNAMIC_PARTITION:
             case OperationType.OP_MODIFY_IN_MEMORY:
-            case OperationType.OP_MODIFY_REPLICATION_NUM: {
+            case OperationType.OP_SET_FORBIT_GLOBAL_DICT:
+            case OperationType.OP_MODIFY_REPLICATION_NUM:
+            case OperationType.OP_MODIFY_WRITE_QUORUM:
+            case OperationType.OP_MODIFY_REPLICATED_STORAGE:
+            case OperationType.OP_MODIFY_BINLOG_CONFIG:
+            case OperationType.OP_MODIFY_BINLOG_AVAILABLE_VERSION:
+            case OperationType.OP_MODIFY_ENABLE_PERSISTENT_INDEX:
+            case OperationType.OP_ALTER_TABLE_PROPERTIES:
+            case OperationType.OP_MODIFY_TABLE_CONSTRAINT_PROPERTY: {
                 data = ModifyTablePropertyOperationLog.read(in);
                 isRead = true;
                 break;
@@ -581,6 +683,11 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_ALTER_LOAD_JOB: {
+                data = AlterLoadJobOperationLog.read(in);
+                isRead = true;
+                break;
+            }
             case OperationType.OP_GLOBAL_VARIABLE_V2: {
                 data = GlobalVarPersistInfo.read(in);
                 isRead = true;
@@ -601,6 +708,130 @@ public class JournalEntity implements Writable {
                 isRead = true;
                 break;
             }
+            case OperationType.OP_ADD_ANALYZE_STATUS: {
+                data = AnalyzeStatus.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_REMOVE_ANALYZE_STATUS: {
+                data = AnalyzeStatus.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ADD_BASIC_STATS_META: {
+                data = BasicStatsMeta.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_REMOVE_BASIC_STATS_META: {
+                data = BasicStatsMeta.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ADD_HISTOGRAM_STATS_META: {
+                data = HistogramStatsMeta.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_REMOVE_HISTOGRAM_STATS_META: {
+                data = HistogramStatsMeta.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_MODIFY_HIVE_TABLE_COLUMN: {
+                data = ModifyTableColumnOperationLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_GRANT_IMPERSONATE: {
+                data = ImpersonatePrivInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_REVOKE_IMPERSONATE: {
+                data = ImpersonatePrivInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_CREATE_CATALOG: {
+                data = Catalog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_DROP_CATALOG: {
+                data = DropCatalogLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_CREATE_INSERT_OVERWRITE: {
+                data = CreateInsertOverwriteJobLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_INSERT_OVERWRITE_STATE_CHANGE: {
+                data = InsertOverwriteStateChangeInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ADD_UNUSED_SHARD: { // Deprecated
+                data = ShardInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_DELETE_UNUSED_SHARD: { // Deprecated
+                data = ShardInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_STARMGR: {
+                data = StarMgrJournal.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_CREATE_USER_V2: {
+                data = CreateUserInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_ALTER_USER_V2: {
+                data = AlterUserInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_UPDATE_USER_PROP_V2: {
+                data = UserPropertyInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_DROP_USER_V2: {
+                data = UserIdentity.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_UPDATE_USER_PRIVILEGE_V2: {
+                data = UserPrivilegeCollectionInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_DROP_ROLE_V2:
+            case OperationType.OP_UPDATE_ROLE_PRIVILEGE_V2: {
+                data = RolePrivilegeCollectionInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_AUTH_UPGRADE_V2: {
+                data = AuthUpgradeInfo.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_MV_JOB_STATE:
+                data = MVMaintenanceJob.read(in);
+                isRead = true;
+                break;
+            case OperationType.OP_MV_EPOCH_UPDATE:
+                data = MVEpoch.read(in);
+                isRead = true;
+                break;
             default: {
                 if (Config.ignore_unknown_log_id) {
                     LOG.warn("UNKNOWN Operation Type {}", opCode);
@@ -613,4 +844,3 @@ public class JournalEntity implements Writable {
         Preconditions.checkState(isRead);
     }
 }
-

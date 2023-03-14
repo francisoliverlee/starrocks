@@ -1,44 +1,29 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/exec/schema_scanner/schema_helper.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/schema_scanner/schema_helper.h"
 
-#include <boost/thread/thread.hpp>
 #include <sstream>
 
-#include "exec/text_converter.hpp"
 #include "gen_cpp/FrontendService.h"
 #include "gen_cpp/FrontendService_types.h"
-#include "gen_cpp/PlanNodes_types.h"
 #include "runtime/client_cache.h"
 #include "runtime/exec_env.h"
-#include "runtime/row_batch.h"
 #include "runtime/runtime_state.h"
-#include "runtime/string_value.h"
-#include "runtime/tuple_row.h"
-#include "util/debug_util.h"
 #include "util/network_util.h"
 #include "util/runtime_profile.h"
 #include "util/thrift_rpc_helper.h"
-#include "util/thrift_util.h"
 
 namespace starrocks {
 
@@ -60,6 +45,22 @@ Status SchemaHelper::list_table_status(const std::string& ip, const int32_t port
     return ThriftRpcHelper::rpc<FrontendServiceClient>(
             ip, port,
             [&request, &result](FrontendServiceConnection& client) { client->listTableStatus(*result, request); });
+}
+
+Status SchemaHelper::list_materialized_view_status(const std::string& ip, const int32_t port,
+                                                   const TGetTablesParams& request,
+                                                   TListMaterializedViewStatusResult* result) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(ip, port,
+                                                       [&request, &result](FrontendServiceConnection& client) {
+                                                           client->listMaterializedViewStatus(*result, request);
+                                                       });
+}
+
+Status SchemaHelper::get_tables_info(const std::string& ip, const int32_t port, const TGetTablesInfoRequest& request,
+                                     TGetTablesInfoResponse* response) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(
+            ip, port,
+            [&request, &response](FrontendServiceConnection& client) { client->getTablesInfo(*response, request); });
 }
 
 Status SchemaHelper::describe_table(const std::string& ip, const int32_t port, const TDescribeTableParams& request,
@@ -103,6 +104,36 @@ Status SchemaHelper::get_table_privs(const std::string& ip, const int32_t port, 
     return ThriftRpcHelper::rpc<FrontendServiceClient>(
             ip, port,
             [&request, &result](FrontendServiceConnection& client) { client->getTablePrivs(*result, request); });
+}
+
+Status SchemaHelper::get_tables_config(const std::string& ip, const int32_t port,
+                                       const TGetTablesConfigRequest& var_params,
+                                       TGetTablesConfigResponse* var_result) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(ip, port,
+                                                       [&var_params, &var_result](FrontendServiceConnection& client) {
+                                                           client->getTablesConfig(*var_result, var_params);
+                                                       });
+}
+
+Status SchemaHelper::get_tasks(const std::string& ip, const int32_t port, const TGetTasksParams& var_params,
+                               TGetTaskInfoResult* var_result) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(ip, port,
+                                                       [&var_params, &var_result](FrontendServiceConnection& client) {
+                                                           client->getTasks(*var_result, var_params);
+                                                       });
+}
+
+Status SchemaHelper::get_task_runs(const std::string& ip, const int32_t port, const TGetTasksParams& var_params,
+                                   TGetTaskRunInfoResult* var_result) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(ip, port,
+                                                       [&var_params, &var_result](FrontendServiceConnection& client) {
+                                                           client->getTaskRuns(*var_result, var_params);
+                                                       });
+}
+
+void fill_data_column_with_null(Column* data_column) {
+    auto* nullable_column = down_cast<NullableColumn*>(data_column);
+    nullable_column->append_nulls(1);
 }
 
 } // namespace starrocks

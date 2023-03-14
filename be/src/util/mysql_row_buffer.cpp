@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/mysql_row_buffer.cpp
 
@@ -26,12 +39,10 @@
 #include <ryu/ryu.h>
 
 #include <cstdio>
-#include <cstdlib>
 #include <type_traits>
 
 #include "common/logging.h"
 #include "gutil/strings/fastmem.h"
-#include "gutil/strings/numbers.h"
 #include "util/mysql_global.h"
 
 namespace starrocks {
@@ -42,7 +53,7 @@ namespace starrocks {
 // = 252: the next two byte is length
 // = 253: the next three byte is length
 // = 254: the next eighth byte is length
-static char* pack_vlen(char* packet, uint64_t length) {
+static uint8_t* pack_vlen(uint8_t* packet, uint64_t length) {
     if (length < 251ULL) {
         int1store(packet, length);
         return packet + 1;
@@ -121,23 +132,23 @@ void MysqlRowBuffer::push_number(T data) {
     _data.resize(pos - _data.data());
 }
 
-void MysqlRowBuffer::push_string(const char* str, size_t length) {
+void MysqlRowBuffer::push_string(const char* str, size_t length, char escape_char) {
     if (_array_level == 0) {
         _push_string_normal(str, length);
     } else {
-        const size_t escaped_len = 2 + _length_after_escape(str, length);
-        //                  ^^^ Surround the string with two double-quotas.
+        // Surround the string with two double-quotas.
+        const size_t escaped_len = 2 + _length_after_escape(str, length, escape_char);
         char* pos = _resize_extra(escaped_len);
-        *pos++ = '"';
+        *pos++ = escape_char;
         if (escaped_len == length + 2) {
             // No '\' or '"' exists in |str|, copy directly.
             strings::memcpy_inlined(pos, str, length);
             pos += length;
         } else {
             // Escape '\' and '"'.
-            pos = _escape(pos, str, length);
+            pos = _escape(pos, str, length, escape_char);
         }
-        *pos++ = '"';
+        *pos++ = escape_char;
         DCHECK_EQ(_data.data() + _data.size(), pos);
         _data.resize(pos - _data.data());
     }
@@ -195,30 +206,26 @@ void MysqlRowBuffer::separator(char c) {
     _data.push_back(c);
 }
 
-size_t MysqlRowBuffer::_length_after_escape(const char* str, size_t length) {
+size_t MysqlRowBuffer::_length_after_escape(const char* str, size_t length, char escape_char) {
     size_t new_len = length;
     for (size_t i = 0; i < length; i++) {
-        new_len += ((str[i] == '"') | (str[i] == '\\'));
+        new_len += ((str[i] == escape_char) | (str[i] == '\\'));
         //                         ^^ use '|' or instead of '||' intentionally.
     }
     return new_len;
 }
 
-char* MysqlRowBuffer::_escape(char* dst, const char* src, size_t length) {
+char* MysqlRowBuffer::_escape(char* dst, const char* src, size_t length, char escape_char) {
     for (size_t i = 0; i < length; i++) {
         char c = src[i];
-        switch (c) {
-        case '"':
+        if (c == escape_char) {
             *dst++ = '\\';
-            *dst++ = '"';
-            break;
-        case '\\':
+            *dst++ = escape_char;
+        } else if (c == '\\') {
             *dst++ = '\\';
             *dst++ = '\\';
-            break;
-        default:
+        } else {
             *dst++ = c;
-            break;
         }
     }
     return dst;
@@ -226,7 +233,7 @@ char* MysqlRowBuffer::_escape(char* dst, const char* src, size_t length) {
 
 void MysqlRowBuffer::_push_string_normal(const char* str, size_t length) {
     char* pos = _resize_extra(9 + length);
-    pos = pack_vlen(pos, length);
+    pos = reinterpret_cast<char*>(pack_vlen(reinterpret_cast<uint8_t*>(pos), length));
     strings::memcpy_inlined(pos, str, length);
     pos += length;
     DCHECK(pos >= _data.data() && pos <= _data.data() + _data.size());

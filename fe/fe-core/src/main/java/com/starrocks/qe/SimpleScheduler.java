@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/SimpleScheduler.java
 
@@ -21,13 +34,14 @@
 
 package com.starrocks.qe;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.common.FeConstants;
+import com.starrocks.common.Config;
 import com.starrocks.common.Reference;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TScanRangeLocation;
@@ -40,11 +54,15 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import javax.annotation.Nullable;
 
 public class SimpleScheduler {
-    private static AtomicLong nextId = new AtomicLong(0);
-    private static final Logger LOG = LogManager.getLogger(SimpleScheduler.class);
-
+    private static Logger LOG = LogManager.getLogger(SimpleScheduler.class);
+    //count id for compute node get TNetworkAddress
+    private static AtomicLong nextComputeNodeHostId = new AtomicLong(0);
+    //count id for backend get TNetworkAddress
+    private static AtomicLong nextBackendHostId = new AtomicLong(0);
+    //count id for get ComputeNode
     private static Map<Long, Integer> blacklistBackends = Maps.newHashMap();
     private static Lock lock = new ReentrantLock();
     private static UpdateBlacklistThread updateBlacklistThread;
@@ -54,6 +72,7 @@ public class SimpleScheduler {
         updateBlacklistThread.start();
     }
 
+    @Nullable
     public static TNetworkAddress getHost(long backendId,
                                           List<TScanRangeLocation> locations,
                                           ImmutableMap<Long, Backend> backends,
@@ -89,46 +108,55 @@ public class SimpleScheduler {
         return null;
     }
 
-    public static TNetworkAddress getHost(ImmutableMap<Long, Backend> backends,
-                                          Reference<Long> backendIdRef) {
-        if (backends == null) {
+    @Nullable
+    public static TNetworkAddress getComputeNodeHost(ImmutableMap<Long, ComputeNode> computeNodes,
+                                                     Reference<Long> computeNodeIdRef) {
+        ComputeNode node = getComputeNode(computeNodes);
+        if (node != null) {
+            computeNodeIdRef.setRef(node.getId());
+            return new TNetworkAddress(node.getHost(), node.getBePort());
+        }
+        return null;
+    }
+
+    @Nullable
+    public static TNetworkAddress getBackendHost(ImmutableMap<Long, Backend> backendMap,
+                                                 Reference<Long> backendIdRef) {
+        Backend node = getBackend(backendMap);
+        if (node != null) {
+            backendIdRef.setRef(node.getId());
+            return new TNetworkAddress(node.getHost(), node.getBePort());
+        }
+        return null;
+    }
+
+    @Nullable
+    public static Backend getBackend(ImmutableMap<Long, Backend> nodeMap) {
+        if (nodeMap == null || nodeMap.isEmpty()) {
             return null;
         }
-        int backendSize = backends.size();
-        if (backendSize == 0) {
+        return chooseNode(nodeMap.values().asList(), nextBackendHostId);
+    }
+
+    @Nullable
+    public static ComputeNode getComputeNode(ImmutableMap<Long, ComputeNode> nodeMap) {
+        if (nodeMap == null || nodeMap.isEmpty()) {
             return null;
         }
-        long id = nextId.getAndIncrement() % backendSize;
+        return chooseNode(nodeMap.values().asList(), nextComputeNodeHostId);
+    }
 
-        List<Long> idToBackendId = Lists.newArrayList();
-        idToBackendId.addAll(backends.keySet());
-        Long backendId = idToBackendId.get((int) id);
-        Backend backend = backends.get(backendId);
-
-        if (backend != null && backend.isAlive() && !blacklistBackends.containsKey(backendId)) {
-            backendIdRef.setRef(backendId);
-            return new TNetworkAddress(backend.getHost(), backend.getBePort());
-        } else {
-            long candidateId = id + 1;  // get next candidate id
-            for (int i = 0; i < backendSize; i++, candidateId++) {
-                LOG.debug("i={} candidatedId={}", i, candidateId);
-                if (candidateId >= backendSize) {
-                    candidateId = 0;
-                }
-                if (candidateId == id) {
-                    continue;
-                }
-                Long candidatebackendId = idToBackendId.get((int) candidateId);
-                LOG.debug("candidatebackendId={}", candidatebackendId);
-                Backend candidateBackend = backends.get(candidatebackendId);
-                if (candidateBackend != null && candidateBackend.isAlive()
-                        && !blacklistBackends.containsKey(candidatebackendId)) {
-                    backendIdRef.setRef(candidatebackendId);
-                    return new TNetworkAddress(candidateBackend.getHost(), candidateBackend.getBePort());
-                }
+    @Nullable
+    private static <T extends ComputeNode> T chooseNode(ImmutableList<T> nodes, AtomicLong nextId) {
+        long id = nextId.getAndIncrement();
+        for (int i = 0; i < nodes.size(); i++) {
+            T node = nodes.get((int) (id % nodes.size()));
+            if (node != null && node.isAlive() && !blacklistBackends.containsKey(node.getId())) {
+                nextId.addAndGet(i); // skip failed nodes
+                return node;
             }
+            id++;
         }
-        // no backend returned
         return null;
     }
 
@@ -138,7 +166,7 @@ public class SimpleScheduler {
         }
         lock.lock();
         try {
-            int tryTime = FeConstants.heartbeat_interval_second + 1;
+            int tryTime = Config.heartbeat_timeout_second + 1;
             blacklistBackends.put(backendID, tryTime);
             LOG.warn("add black list " + backendID);
         } finally {
@@ -174,7 +202,7 @@ public class SimpleScheduler {
             while (true) {
                 try {
                     Thread.sleep(1000L);
-                    SystemInfoService clusterInfoService = Catalog.getCurrentSystemInfo();
+                    SystemInfoService clusterInfoService = GlobalStateMgr.getCurrentSystemInfo();
                     LOG.debug("UpdateBlacklistThread retry begin");
                     lock.lock();
                     try {

@@ -1,35 +1,38 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
+#include <limits>
+
 #include "column/binary_column.h"
 #include "column/decimalv3_column.h"
+#include "column/json_column.h"
 #include "column/nullable_column.h"
 #include "column/object_column.h"
-#include "runtime/primitive_type.h"
+#include "column/vectorized_fwd.h"
+#include "types/constexpr.h"
+#include "types/logical_type.h"
+#include "util/json.h"
 
 namespace starrocks {
-namespace vectorized {
 
 template <bool B, typename T>
 struct cond {
     static constexpr bool value = B;
     using type = T;
 };
-
-template <typename Condition, typename... OtherConditions>
-struct type_select {
-    using type = std::conditional_t<Condition::value, typename Condition::type,
-                                    typename type_select<OtherConditions...>::type>;
-};
-
-template <typename Condition>
-struct type_select<Condition> {
-    using type = std::conditional_t<Condition::value, typename Condition::type, void>;
-};
-
-template <typename Condition, typename... OtherConditions>
-using type_select_t = typename type_select<Condition, OtherConditions...>::type;
 
 template <typename T>
 constexpr bool IsInt128 = false;
@@ -49,49 +52,44 @@ template <>
 inline constexpr bool IsDateTime<DateValue> = true;
 
 template <typename T>
-constexpr bool IsObject = false;
-template <>
-inline constexpr bool IsObject<HyperLogLog> = true;
-template <>
-inline constexpr bool IsObject<BitmapValue> = true;
-template <>
-inline constexpr bool IsObject<PercentileValue> = true;
-
-template <typename T>
 using is_starrocks_arithmetic = std::integral_constant<bool, std::is_arithmetic_v<T> || IsDecimal<T>>;
 
-template <typename T>
-using is_sum_bigint = std::integral_constant<bool, std::is_integral_v<T> && !IsInt128<T>>;
-
-// If isArithmeticPT is true, means this type support +,-,*,/
-template <PrimitiveType primitive_type>
-constexpr bool isArithmeticPT = true;
+// If isArithmeticLT is true, means this type support +,-,*,/
+template <LogicalType logical_type>
+constexpr bool isArithmeticLT = true;
 
 template <>
-inline constexpr bool isArithmeticPT<TYPE_CHAR> = false;
+inline constexpr bool isArithmeticLT<TYPE_CHAR> = false;
 template <>
-inline constexpr bool isArithmeticPT<TYPE_VARCHAR> = false;
+inline constexpr bool isArithmeticLT<TYPE_VARCHAR> = false;
 template <>
-inline constexpr bool isArithmeticPT<TYPE_DATE> = false;
+inline constexpr bool isArithmeticLT<TYPE_DATE> = false;
 template <>
-inline constexpr bool isArithmeticPT<TYPE_DATETIME> = false;
+inline constexpr bool isArithmeticLT<TYPE_DATETIME> = false;
 template <>
-inline constexpr bool isArithmeticPT<TYPE_HLL> = false;
+inline constexpr bool isArithmeticLT<TYPE_HLL> = false;
 template <>
-inline constexpr bool isArithmeticPT<TYPE_OBJECT> = false;
+inline constexpr bool isArithmeticLT<TYPE_OBJECT> = false;
 template <>
-inline constexpr bool isArithmeticPT<TYPE_PERCENTILE> = false;
+inline constexpr bool isArithmeticLT<TYPE_PERCENTILE> = false;
+template <>
+inline constexpr bool isArithmeticLT<TYPE_JSON> = false;
+template <>
+inline constexpr bool isArithmeticLT<TYPE_VARBINARY> = false;
 
-template <PrimitiveType primitive_type>
-constexpr bool isSlicePT = false;
+template <LogicalType logical_type>
+constexpr bool isSliceLT = false;
 
 template <>
-inline constexpr bool isSlicePT<TYPE_CHAR> = true;
+inline constexpr bool isSliceLT<TYPE_CHAR> = true;
 
 template <>
-inline constexpr bool isSlicePT<TYPE_VARCHAR> = true;
+inline constexpr bool isSliceLT<TYPE_VARCHAR> = true;
 
-template <PrimitiveType primitive_type>
+template <>
+inline constexpr bool isSliceLT<TYPE_VARBINARY> = true;
+
+template <LogicalType logical_type>
 struct RunTimeTypeTraits {};
 
 template <>
@@ -220,11 +218,32 @@ struct RunTimeTypeTraits<TYPE_PERCENTILE> {
     using ColumnType = PercentileColumn;
 };
 
-template <PrimitiveType Type>
+template <>
+struct RunTimeTypeTraits<TYPE_JSON> {
+    using CppType = JsonValue*;
+    using ColumnType = JsonColumn;
+};
+
+template <>
+struct RunTimeTypeTraits<TYPE_VARBINARY> {
+    using CppType = Slice;
+    using ColumnType = BinaryColumn;
+};
+
+template <LogicalType Type>
 using RunTimeCppType = typename RunTimeTypeTraits<Type>::CppType;
 
-template <PrimitiveType Type>
+template <LogicalType Type>
 using RunTimeColumnType = typename RunTimeTypeTraits<Type>::ColumnType;
+
+// Movable: rvalue reference type
+template <LogicalType Type>
+using RunTimeCppMovableType = std::add_rvalue_reference_t<std::remove_pointer_t<RunTimeCppType<Type>>>;
+
+template <LogicalType Type>
+using RunTimeCppValueType = std::remove_pointer_t<RunTimeCppType<Type>>;
+
+// Value type instead of pointer type
 
 template <typename T>
 struct ColumnTraits {};
@@ -288,5 +307,88 @@ template <>
 struct ColumnTraits<TimestampValue> {
     using ColumnType = TimestampColumn;
 };
-} // namespace vectorized
+
+// Length of fixed-length type, 0 for dynamic-length type
+template <LogicalType ltype, typename = guard::Guard>
+struct RunTimeFixedTypeLength {
+    static constexpr size_t value = 0;
+};
+
+template <LogicalType ltype>
+struct RunTimeFixedTypeLength<ltype, FixedLengthLTGuard<ltype>> {
+    static constexpr size_t value = sizeof(RunTimeCppType<ltype>);
+};
+
+template <LogicalType ltype, typename = guard::Guard>
+struct RunTimeTypeLimits {};
+
+template <LogicalType ltype>
+struct RunTimeTypeLimits<ltype, ArithmeticLTGuard<ltype>> {
+    // Cpp type of this logical type
+    using value_type = RunTimeCppType<ltype>;
+
+    static constexpr value_type min_value() { return std::numeric_limits<value_type>::lowest(); }
+    static constexpr value_type max_value() { return std::numeric_limits<value_type>::max(); }
+};
+
+template <>
+struct RunTimeTypeLimits<TYPE_LARGEINT> {
+    using value_type = RunTimeCppType<TYPE_LARGEINT>;
+
+    static constexpr value_type min_value() { return MIN_INT128; }
+    static constexpr value_type max_value() { return MAX_INT128; }
+};
+
+template <LogicalType ltype>
+struct RunTimeTypeLimits<ltype, StringLTGuard<ltype>> {
+    using value_type = RunTimeCppType<ltype>;
+
+    static constexpr value_type min_value() { return Slice(&_min, 0); }
+    static constexpr value_type max_value() { return Slice(&_max, 1); }
+
+private:
+    static inline char _min = 0x00;
+    static inline char _max = 0xff;
+};
+
+template <>
+struct RunTimeTypeLimits<TYPE_DATE> {
+    using value_type = RunTimeCppType<TYPE_DATE>;
+
+    static value_type min_value() { return DateValue::MIN_DATE_VALUE; }
+    static value_type max_value() { return DateValue::MAX_DATE_VALUE; }
+};
+
+template <>
+struct RunTimeTypeLimits<TYPE_DATETIME> {
+    using value_type = RunTimeCppType<TYPE_DATETIME>;
+
+    static value_type min_value() { return TimestampValue::MIN_TIMESTAMP_VALUE; }
+    static value_type max_value() { return TimestampValue::MAX_TIMESTAMP_VALUE; }
+};
+
+template <>
+struct RunTimeTypeLimits<TYPE_DECIMALV2> {
+    using value_type = RunTimeCppType<TYPE_DECIMALV2>;
+
+    static value_type min_value() { return DecimalV2Value::get_min_decimal(); }
+    static value_type max_value() { return DecimalV2Value::get_max_decimal(); }
+};
+
+template <LogicalType ltype>
+struct RunTimeTypeLimits<ltype, DecimalLTGuard<ltype>> {
+    using value_type = RunTimeCppType<ltype>;
+
+    static constexpr value_type min_value() { return get_min_decimal<value_type>(); }
+    static constexpr value_type max_value() { return get_max_decimal<value_type>(); }
+};
+
+template <>
+struct RunTimeTypeLimits<TYPE_JSON> {
+    using value_type = JsonValue;
+
+    static value_type min_value() { return JsonValue{vpack::Slice::minKeySlice()}; }
+    static value_type max_value() { return JsonValue{vpack::Slice::maxKeySlice()}; }
+};
+
 } // namespace starrocks

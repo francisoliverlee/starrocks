@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/external/elasticsearch/EsTestCase.java
 
@@ -21,15 +34,15 @@
 
 package com.starrocks.external.elasticsearch;
 
-import com.starrocks.catalog.Catalog;
-import com.starrocks.catalog.CatalogTestUtil;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.EsTable;
-import com.starrocks.catalog.FakeCatalog;
 import com.starrocks.catalog.FakeEditLog;
+import com.starrocks.catalog.FakeGlobalStateMgr;
+import com.starrocks.catalog.GlobalStateMgrTestUtil;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.meta.MetaContext;
+import com.starrocks.server.GlobalStateMgr;
 import org.junit.BeforeClass;
 
 import java.io.BufferedReader;
@@ -47,20 +60,20 @@ import java.util.Random;
 public class EsTestCase {
 
     protected static FakeEditLog fakeEditLog;
-    protected static FakeCatalog fakeCatalog;
-    protected static Catalog masterCatalog;
+    protected static FakeGlobalStateMgr fakeGlobalStateMgr;
+    protected static GlobalStateMgr masterGlobalStateMgr;
     protected static String mappingsStr = "";
 
     @BeforeClass
     public static void init() throws Exception {
         fakeEditLog = new FakeEditLog();
-        fakeCatalog = new FakeCatalog();
-        masterCatalog = CatalogTestUtil.createTestCatalog();
+        fakeGlobalStateMgr = new FakeGlobalStateMgr();
+        masterGlobalStateMgr = GlobalStateMgrTestUtil.createTestState();
         MetaContext metaContext = new MetaContext();
         metaContext.setMetaVersion(FeMetaVersion.VERSION_40);
         metaContext.setThreadLocalInfo();
-        // masterCatalog.setJournalVersion(FeMetaVersion.VERSION_40);
-        FakeCatalog.setCatalog(masterCatalog);
+        // masterGlobalStateMgr.setJournalVersion(FeMetaVersion.VERSION_40);
+        FakeGlobalStateMgr.setGlobalStateMgr(masterGlobalStateMgr);
     }
 
     protected String loadJsonFromFile(String fileName) throws IOException, URISyntaxException {

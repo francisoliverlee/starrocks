@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/query_statistics.cpp
 
@@ -23,8 +36,61 @@
 
 namespace starrocks {
 
-void QueryStatistics::merge(QueryStatisticsRecvr* recvr) {
-    recvr->merge(this);
+void QueryStatistics::to_pb(PQueryStatistics* statistics) {
+    DCHECK(statistics != nullptr);
+    statistics->set_scan_rows(scan_rows);
+    statistics->set_scan_bytes(scan_bytes);
+    statistics->set_returned_rows(returned_rows);
+    statistics->set_cpu_cost_ns(cpu_ns);
+    statistics->set_mem_cost_bytes(mem_cost_bytes);
+    *statistics->mutable_stats_items() = {_stats_items.begin(), _stats_items.end()};
+}
+
+void QueryStatistics::clear() {
+    scan_rows = 0;
+    scan_bytes = 0;
+    cpu_ns = 0;
+    returned_rows = 0;
+    _stats_items.clear();
+}
+
+void QueryStatistics::add_stats_item(QueryStatisticsItemPB& stats_item) {
+    this->_stats_items.emplace_back(stats_item);
+    this->scan_rows += stats_item.scan_rows();
+    this->scan_bytes += stats_item.scan_bytes();
+}
+
+void QueryStatistics::add_scan_stats(int64_t scan_rows, int64_t scan_bytes) {
+    this->scan_rows += scan_rows;
+    this->scan_bytes += scan_bytes;
+}
+
+void QueryStatistics::merge(int sender_id, QueryStatistics& other) {
+    // Make the exchange action atomic
+    int64_t scan_rows = other.scan_rows.load();
+    this->scan_rows += scan_rows;
+    other.scan_rows -= scan_rows;
+
+    int64_t scan_bytes = other.scan_bytes.load();
+    this->scan_bytes += scan_bytes;
+    other.scan_bytes -= scan_bytes;
+
+    int64_t cpu_ns = other.cpu_ns.load();
+    this->cpu_ns += cpu_ns;
+    other.cpu_ns -= cpu_ns;
+
+    int64_t mem_cost_bytes = other.mem_cost_bytes.load();
+    this->mem_cost_bytes = std::max<int64_t>(this->mem_cost_bytes, mem_cost_bytes);
+
+    _stats_items.insert(_stats_items.end(), other._stats_items.begin(), other._stats_items.end());
+}
+
+void QueryStatistics::merge_pb(const PQueryStatistics& statistics) {
+    scan_rows += statistics.scan_rows();
+    scan_bytes += statistics.scan_bytes();
+    cpu_ns += statistics.cpu_cost_ns();
+    mem_cost_bytes = std::max<int64_t>(mem_cost_bytes, statistics.mem_cost_bytes());
+    _stats_items.insert(_stats_items.end(), statistics.stats_items().begin(), statistics.stats_items().end());
 }
 
 void QueryStatisticsRecvr::insert(const PQueryStatistics& statistics, int sender_id) {
@@ -38,6 +104,13 @@ void QueryStatisticsRecvr::insert(const PQueryStatistics& statistics, int sender
         query_statistics = iter->second;
     }
     query_statistics->merge_pb(statistics);
+}
+
+void QueryStatisticsRecvr::aggregate(QueryStatistics* statistics) {
+    std::lock_guard<SpinLock> l(_lock);
+    for (auto& pair : _query_statistics) {
+        statistics->merge(pair.first, *pair.second);
+    }
 }
 
 QueryStatisticsRecvr::~QueryStatisticsRecvr() {

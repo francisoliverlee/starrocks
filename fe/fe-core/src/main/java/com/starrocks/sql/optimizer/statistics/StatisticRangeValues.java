@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.statistics;
 
@@ -43,6 +56,10 @@ public class StatisticRangeValues {
         return isNaN(low) && isNaN(high);
     }
 
+    public boolean isBothInfinite() {
+        return isInfinite(low) && isInfinite(high);
+    }
+
     public static StatisticRangeValues from(ColumnStatistic column) {
         return new StatisticRangeValues(column.getMinValue(), column.getMaxValue(), column.getDistinctValuesCount());
     }
@@ -70,8 +87,8 @@ public class StatisticRangeValues {
         if (this.isEmpty() || other.isEmpty()) {
             return 0.0;
         }
-
-        if (this.equals(other)) {
+        // If the low and high values is infinite, it represents either string type or unknown of column statistics.
+        if (this.equals(other) && !isBothInfinite()) {
             return 1.0;
         }
 
@@ -79,12 +96,12 @@ public class StatisticRangeValues {
         // lengthOfIntersect of char/varchar is infinite
         if (isInfinite(lengthOfIntersect)) {
             if (isFinite(this.distinctValues) && isFinite(other.distinctValues)) {
-                return min(other.distinctValues / this.distinctValues, 1);
+                return min(other.distinctValues / max(1, this.distinctValues), 1);
             }
-            return 0.5;
+            return StatisticsEstimateCoefficient.OVERLAP_INFINITE_RANGE_FILTER_COEFFICIENT;
         }
         if (lengthOfIntersect == 0) {
-            // distinctValues equals 1 means the column statistics is default,
+            // distinctValues equals 1 means the column statistics is unknown,
             // requires special treatment
             if (this.distinctValues == 1 && length() > 1) {
                 return 0.5;
@@ -97,14 +114,14 @@ public class StatisticRangeValues {
 
         double length = length();
         if (isInfinite(length)) {
-            return 0.5;
+            return StatisticsEstimateCoefficient.OVERLAP_INFINITE_RANGE_FILTER_COEFFICIENT;
         }
 
         if (lengthOfIntersect > 0) {
             return lengthOfIntersect / length;
         }
-
-        return NaN;
+        // length of intersect may be NAN, because min/max may be -infinite/infinite at same time
+        return StatisticsEstimateCoefficient.OVERLAP_INFINITE_RANGE_FILTER_COEFFICIENT;
     }
 
     public StatisticRangeValues intersect(StatisticRangeValues other) {

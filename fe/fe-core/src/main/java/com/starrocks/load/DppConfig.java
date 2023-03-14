@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/DppConfig.java
 
@@ -23,13 +36,13 @@ package com.starrocks.load;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.LoadStmt;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.LoadException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.LoadStmt;
 import com.starrocks.thrift.TPriority;
 
 import java.io.DataInput;
@@ -38,6 +51,7 @@ import java.io.IOException;
 import java.util.Iterator;
 import java.util.Map;
 
+@Deprecated
 public class DppConfig implements Writable {
     // necessary hadoop job config keys
     private static final String FS_DEFAULT_NAME = "fs.default.name";
@@ -56,7 +70,7 @@ public class DppConfig implements Writable {
     private static final String APPLICATIONS_PATH = "applications";
     private static final String OUTPUT_PATH = "output";
 
-    public static final String PALO_PATH = "hadoop_palo_path";
+    public static final String STARROCKS_PATH = "hadoop_starrocks_path";
     public static final String HTTP_PORT = "hadoop_http_port";
     public static final String HADOOP_CONFIGS = "hadoop_configs";
     public static final String PRIORITY = "priority";
@@ -65,14 +79,14 @@ public class DppConfig implements Writable {
 
     private static final int DEFAULT_HTTP_PORT = 8070;
 
-    // palo base path in hadoop
-    //   dpp: paloPath/cluster_id/applications/dpp_version
-    //   output: paloPath/cluster_id/output
-    private String paloPath;
+    // starrocks base path in hadoop
+    //   dpp: starrocksPath/cluster_id/applications/dpp_version
+    //   output: starrocksPath/cluster_id/output
+    private String starrocksPath;
     private int httpPort;
     private Map<String, String> hadoopConfigs;
 
-    // priority for palo internal schedule
+    // priority for starrocks internal schedule
     // for now are etl submit schedule and download file schedule
     private TPriority priority;
 
@@ -81,15 +95,15 @@ public class DppConfig implements Writable {
         this(null, -1, null, null);
     }
 
-    private DppConfig(String paloPath, int httpPort, Map<String, String> hadoopConfigs, TPriority priority) {
-        this.paloPath = paloPath;
+    private DppConfig(String starrocksPath, int httpPort, Map<String, String> hadoopConfigs, TPriority priority) {
+        this.starrocksPath = starrocksPath;
         this.httpPort = httpPort;
         this.hadoopConfigs = hadoopConfigs;
         this.priority = priority;
     }
 
     public static DppConfig create(Map<String, String> configMap) throws LoadException {
-        String paloPath = null;
+        String starrocksPath = null;
         int httpPort = -1;
         Map<String, String> hadoopConfigs = Maps.newHashMap();
         TPriority priority = null;
@@ -98,12 +112,12 @@ public class DppConfig implements Writable {
             String key = entry.getKey();
             String value = entry.getValue();
 
-            if (key.equalsIgnoreCase(PALO_PATH)) {
-                // palo path
+            if (key.equalsIgnoreCase(STARROCKS_PATH)) {
+                // starrocks path
                 if (Strings.isNullOrEmpty(value)) {
-                    throw new LoadException("Load cluster " + PALO_PATH + " is null");
+                    throw new LoadException("Load cluster " + STARROCKS_PATH + " is null");
                 }
-                paloPath = value.trim();
+                starrocksPath = value.trim();
             } else if (key.equalsIgnoreCase(HTTP_PORT)) {
                 // http port
                 try {
@@ -146,7 +160,7 @@ public class DppConfig implements Writable {
             hadoopConfigs = null;
         }
 
-        return new DppConfig(paloPath, httpPort, hadoopConfigs, priority);
+        return new DppConfig(starrocksPath, httpPort, hadoopConfigs, priority);
     }
 
     public void update(DppConfig dppConfig) {
@@ -158,8 +172,8 @@ public class DppConfig implements Writable {
             return;
         }
 
-        if (dppConfig.paloPath != null) {
-            paloPath = dppConfig.paloPath;
+        if (dppConfig.starrocksPath != null) {
+            starrocksPath = dppConfig.starrocksPath;
         }
 
         if (dppConfig.httpPort != -1) {
@@ -224,8 +238,8 @@ public class DppConfig implements Writable {
     }
 
     public void resetConfigByKey(String key) throws LoadException {
-        if (key.equalsIgnoreCase(PALO_PATH)) {
-            paloPath = null;
+        if (key.equalsIgnoreCase(STARROCKS_PATH)) {
+            starrocksPath = null;
         } else if (key.equalsIgnoreCase(HTTP_PORT)) {
             httpPort = DEFAULT_HTTP_PORT;
         } else if (key.equalsIgnoreCase(HADOOP_CONFIGS)) {
@@ -250,8 +264,8 @@ public class DppConfig implements Writable {
     }
 
     public void check() throws LoadException {
-        if (Strings.isNullOrEmpty(paloPath)) {
-            throw new LoadException("Load cluster " + PALO_PATH + " is null");
+        if (Strings.isNullOrEmpty(starrocksPath)) {
+            throw new LoadException("Load cluster " + STARROCKS_PATH + " is null");
         }
 
         if (httpPort == -1) {
@@ -280,24 +294,25 @@ public class DppConfig implements Writable {
             copiedHadoopConfigs = Maps.newHashMap(hadoopConfigs);
         }
 
-        return new DppConfig(paloPath, httpPort, copiedHadoopConfigs, priority);
+        return new DppConfig(starrocksPath, httpPort, copiedHadoopConfigs, priority);
     }
 
-    public static String getPaloPathKey() {
-        return PALO_PATH;
+    public static String getStarRocksPathKey() {
+        return STARROCKS_PATH;
     }
 
-    public String getPaloPath() {
-        return paloPath;
+    public String getStarRocksPath() {
+        return starrocksPath;
     }
 
     public String getApplicationsPath() {
-        return String.format("%s/%d/%s/%s", paloPath, Catalog.getCurrentCatalog().getClusterId(), APPLICATIONS_PATH,
-                FeConstants.dpp_version);
+        return String.format("%s/%d/%s/%s", starrocksPath, GlobalStateMgr.getCurrentState().getClusterId(),
+                APPLICATIONS_PATH,
+                FeConstants.DPP_VERSION);
     }
 
     public String getOutputPath() {
-        return String.format("%s/%d/%s", paloPath, Catalog.getCurrentCatalog().getClusterId(), OUTPUT_PATH);
+        return String.format("%s/%d/%s", starrocksPath, GlobalStateMgr.getCurrentState().getClusterId(), OUTPUT_PATH);
     }
 
     public static String getHttpPortKey() {
@@ -353,14 +368,15 @@ public class DppConfig implements Writable {
 
     @Override
     public String toString() {
-        return "DppConfig{paloPath=" + paloPath + ", httpPort=" + httpPort + ", hadoopConfigs=" + hadoopConfigs + "}";
+        return "DppConfig{starrocksPath=" + starrocksPath + ", httpPort=" + httpPort + ", hadoopConfigs=" +
+                hadoopConfigs + "}";
     }
 
     @Override
     public void write(DataOutput out) throws IOException {
-        if (paloPath != null) {
+        if (starrocksPath != null) {
             out.writeBoolean(true);
-            Text.writeString(out, paloPath);
+            Text.writeString(out, starrocksPath);
         } else {
             out.writeBoolean(false);
         }
@@ -385,22 +401,22 @@ public class DppConfig implements Writable {
     }
 
     public void readFields(DataInput in) throws IOException {
-        boolean readPaloPath = false;
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_12) {
+        boolean readStarRocksPath = false;
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_12) {
             if (in.readBoolean()) {
-                readPaloPath = true;
+                readStarRocksPath = true;
             }
         } else {
-            readPaloPath = true;
+            readStarRocksPath = true;
         }
-        if (readPaloPath) {
-            paloPath = Text.readString(in);
+        if (readStarRocksPath) {
+            starrocksPath = Text.readString(in);
         }
 
         httpPort = in.readInt();
 
         boolean readHadoopConfigs = false;
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_12) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_12) {
             if (in.readBoolean()) {
                 readHadoopConfigs = true;
             }
@@ -415,15 +431,11 @@ public class DppConfig implements Writable {
             }
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_15) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_15) {
             this.priority = TPriority.valueOf(Text.readString(in));
         } else {
             this.priority = TPriority.NORMAL;
         }
     }
 
-    @Override
-    public boolean equals(Object obj) {
-        return true;
-    }
 }

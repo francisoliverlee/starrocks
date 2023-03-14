@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/proc/CurrentQueryStatisticsProcDir.java
 
@@ -42,9 +55,10 @@ public class CurrentQueryStatisticsProcDir implements ProcDirInterface {
     private static final Logger LOG = LogManager.getLogger(CurrentQueryStatisticsProcDir.class);
     public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("QueryId").add("ConnectionId").add("Database").add("User")
-            .add("ScanBytes").add("ProcessRows").add("ExecTime").build();
+            .add("ScanBytes").add("ProcessRows").add("CPUCostSeconds").add("MemoryUsageBytes")
+            .add("ExecTime").build();
 
-    private static final int EXEC_TIME_INDEX = 6;
+    private static final int EXEC_TIME_INDEX = 8;
 
     @Override
     public boolean register(String name, ProcNodeInterface node) {
@@ -76,17 +90,21 @@ public class CurrentQueryStatisticsProcDir implements ProcDirInterface {
         final Map<String, CurrentQueryInfoProvider.QueryStatistics> statisticsMap
                 = provider.getQueryStatistics(statistic.values());
         for (QueryStatisticsItem item : statistic.values()) {
+            final CurrentQueryInfoProvider.QueryStatistics statistics = statisticsMap.get(item.getQueryId());
+            if (statistics == null) {
+                continue;
+            }
             final List<String> values = Lists.newArrayList();
             values.add(item.getQueryId());
             values.add(item.getConnId());
             values.add(item.getDb());
             values.add(item.getUser());
-            final CurrentQueryInfoProvider.QueryStatistics statistics
-                    = statisticsMap.get(item.getQueryId());
-            values.add(QueryStatisticsFormatter.getScanBytes(
+            values.add(QueryStatisticsFormatter.getBytes(
                     statistics.getScanBytes()));
             values.add(QueryStatisticsFormatter.getRowsReturned(
-                    statistics.getRowsReturned()));
+                    statistics.getScanRows()));
+            values.add(QueryStatisticsFormatter.getCPUCostSeconds(statistics.getCpuCostNs()));
+            values.add(QueryStatisticsFormatter.getBytes(statistics.getMemUsageBytes()));
             values.add(item.getQueryExecTime());
             sortedRowData.add(values);
         }
@@ -94,8 +112,8 @@ public class CurrentQueryStatisticsProcDir implements ProcDirInterface {
         sortedRowData.sort(new Comparator<List<String>>() {
             @Override
             public int compare(List<String> l1, List<String> l2) {
-                final int execTime1 = Integer.valueOf(l1.get(EXEC_TIME_INDEX));
-                final int execTime2 = Integer.valueOf(l2.get(EXEC_TIME_INDEX));
+                final int execTime1 = Integer.parseInt(l1.get(EXEC_TIME_INDEX));
+                final int execTime2 = Integer.parseInt(l2.get(EXEC_TIME_INDEX));
                 return execTime1 <= execTime2 ? 1 : -1;
             }
         });

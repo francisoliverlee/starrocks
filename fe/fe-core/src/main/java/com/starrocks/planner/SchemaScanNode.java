@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/SchemaScanNode.java
 
@@ -22,20 +35,22 @@
 package com.starrocks.planner;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.Lists;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.SchemaTable;
-import com.starrocks.common.Config;
 import com.starrocks.common.UserException;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.service.FrontendOptions;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.system.Backend;
+import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
+import com.starrocks.thrift.TScanRange;
+import com.starrocks.thrift.TScanRangeLocation;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.thrift.TSchemaScanNode;
 import com.starrocks.thrift.TUserIdentity;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 
@@ -43,23 +58,41 @@ import java.util.List;
  * Full scan of an SCHEMA table.
  */
 public class SchemaScanNode extends ScanNode {
-    private static final Logger LOG = LogManager.getLogger(SchemaTable.class);
-
     private final String tableName;
     private String schemaDb;
     private String schemaTable;
     private String schemaWild;
-    private String user;
-    private String userIp;
     private String frontendIP;
     private int frontendPort;
 
+    // only used for BE related schema scans
+    private Long beId = null;
+    private Long tableId = null;
+    private Long partitionId = null;
+    private Long tabletId = null;
+    private Long txnId = null;
+    private List<TScanRangeLocations> beScanRanges = null;
+
+    public void setSchemaDb(String schemaDb) {
+        this.schemaDb = schemaDb;
+    }
+
+    public void setSchemaTable(String schemaTable) {
+        this.schemaTable = schemaTable;
+    }
+
+    public String getSchemaDb() {
+        return schemaDb;
+    }
+
+    public String getSchemaTable() {
+        return schemaTable;
+    }
+
     public void setUser(String user) {
-        this.user = user;
     }
 
     public void setUserIp(String userIp) {
-        this.userIp = userIp;
     }
 
     public void setFrontendIP(String frontendIP) {
@@ -85,15 +118,7 @@ public class SchemaScanNode extends ScanNode {
     }
 
     @Override
-    public void finalize(Analyzer analyzer) throws UserException {
-        // Convert predicates to MySQL columns and filters.
-        schemaDb = analyzer.getSchemaDb();
-        schemaTable = analyzer.getSchemaTable();
-        schemaWild = analyzer.getSchemaWild();
-        user = analyzer.getQualifiedUser();
-        userIp = analyzer.getContext().getRemoteIP();
-        frontendIP = FrontendOptions.getLocalHostAddress();
-        frontendPort = Config.rpc_port;
+    public void finalizeStats(Analyzer analyzer) throws UserException {
     }
 
     @Override
@@ -126,6 +151,62 @@ public class SchemaScanNode extends ScanNode {
 
         TUserIdentity tCurrentUser = ConnectContext.get().getCurrentUserIdentity().toThrift();
         msg.schema_scan_node.setCurrent_user_ident(tCurrentUser);
+
+        if (tableId != null) {
+            msg.schema_scan_node.setTable_id(tableId);
+        }
+
+        if (partitionId != null) {
+            msg.schema_scan_node.setPartition_id(partitionId);
+        }
+
+        if (tabletId != null) {
+            msg.schema_scan_node.setTablet_id(tabletId);
+        }
+    }
+
+    public void setBeId(long beId) {
+        this.beId = beId;
+    }
+
+    public void setTableId(long tableId) {
+        this.tableId = tableId;
+    }
+
+    public void setPartitionId(long partitionId) {
+        this.partitionId = partitionId;
+    }
+
+    public void setTabletId(long tabletId) {
+        this.tabletId = tabletId;
+    }
+
+    public void setTxnId(long txnId) {
+        this.txnId = txnId;
+    }
+
+    public boolean isBeSchemaTable() {
+        return SchemaTable.isBeSchemaTable(tableName);
+    }
+
+    public void computeBeScanRanges() {
+        for (Backend be : GlobalStateMgr.getCurrentSystemInfo().getIdToBackend().values()) {
+            // if user specifies BE id, we try to scan all BEs(including bad BE)
+            // if user doesn't specify BE id, we only scan live BEs
+            if ((be.isAlive() && beId == null) || be.getId() == beId) {
+                if (beScanRanges == null) {
+                    beScanRanges = Lists.newArrayList();
+                }
+                TScanRangeLocations scanRangeLocations = new TScanRangeLocations();
+                TScanRangeLocation location = new TScanRangeLocation();
+                location.setBackend_id(be.getId());
+                location.setServer(new TNetworkAddress(be.getHost(), be.getBePort()));
+                scanRangeLocations.addToLocations(location);
+                TScanRange scanRange = new TScanRange();
+                scanRangeLocations.setScan_range(scanRange);
+                beScanRanges.add(scanRangeLocations);
+            }
+        }
     }
 
     /**
@@ -134,21 +215,22 @@ public class SchemaScanNode extends ScanNode {
      */
     @Override
     public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
-        return null;
+        return beScanRanges;
     }
 
     @Override
     public int getNumInstances() {
-        return 1;
+        return beScanRanges == null ? 1 : beScanRanges.size();
     }
 
     @Override
-    public boolean isVectorized() {
+    public boolean canUsePipeLine() {
         return true;
     }
 
     @Override
-    public void setUseVectorized(boolean flag) {
-        this.useVectorized = flag;
+    public boolean canUseRuntimeAdaptiveDop() {
+        return true;
     }
+
 }

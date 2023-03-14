@@ -8,18 +8,15 @@
 
 #include "gutil/atomic_refcount.h"
 
-namespace starrocks {
-
-namespace subtle {
+namespace starrocks::subtle {
 
 RefCountedBase::RefCountedBase()
-        : ref_count_(0)
 #ifndef NDEBUG
-          ,
-          in_dtor_(false)
-#endif
-{
+        : in_dtor_(false) {
 }
+#else
+        = default;
+#endif
 
 RefCountedBase::~RefCountedBase() {
 #ifndef NDEBUG
@@ -57,7 +54,7 @@ bool RefCountedThreadSafeBase::HasOneRef() const {
     return base::RefCountIsOne(&const_cast<RefCountedThreadSafeBase*>(this)->ref_count_);
 }
 
-RefCountedThreadSafeBase::RefCountedThreadSafeBase() : ref_count_(0) {
+RefCountedThreadSafeBase::RefCountedThreadSafeBase() {
 #ifndef NDEBUG
     in_dtor_ = false;
 #endif
@@ -91,6 +88,4 @@ bool RefCountedThreadSafeBase::Release() const {
     return false;
 }
 
-} // namespace subtle
-
-} // namespace starrocks
+} // namespace starrocks::subtle

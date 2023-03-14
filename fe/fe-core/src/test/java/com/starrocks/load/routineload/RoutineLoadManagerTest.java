@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/load/routineload/RoutineLoadManagerTest.java
 
@@ -23,15 +36,9 @@ package com.starrocks.load.routineload;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.ColumnSeparator;
-import com.starrocks.analysis.CreateRoutineLoadStmt;
 import com.starrocks.analysis.LabelName;
 import com.starrocks.analysis.ParseNode;
-import com.starrocks.analysis.PauseRoutineLoadStmt;
-import com.starrocks.analysis.ResumeRoutineLoadStmt;
-import com.starrocks.analysis.StopRoutineLoadStmt;
 import com.starrocks.analysis.TableName;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
@@ -47,8 +54,16 @@ import com.starrocks.persist.EditLog;
 import com.starrocks.persist.RoutineLoadOperation;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.OriginStatement;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.ColumnSeparator;
+import com.starrocks.sql.ast.CreateRoutineLoadStmt;
+import com.starrocks.sql.ast.PauseRoutineLoadStmt;
+import com.starrocks.sql.ast.ResumeRoutineLoadStmt;
+import com.starrocks.sql.ast.StopRoutineLoadStmt;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TResourceInfo;
+import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
 import mockit.Injectable;
 import mockit.Mock;
@@ -78,7 +93,7 @@ public class RoutineLoadManagerTest {
     public void testAddJobByStmt(@Injectable Auth auth,
                                  @Injectable TResourceInfo tResourceInfo,
                                  @Mocked ConnectContext connectContext,
-                                 @Mocked Catalog catalog) throws UserException {
+                                 @Mocked GlobalStateMgr globalStateMgr) throws UserException {
         String jobName = "job1";
         String dbName = "db1";
         LabelName labelName = new LabelName(dbName, jobName);
@@ -100,7 +115,7 @@ public class RoutineLoadManagerTest {
                 typeName, customProperties);
         createRoutineLoadStmt.setOrigStmt(new OriginStatement("dummy", 0));
 
-        KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, "default_cluster", 1L, 1L,
+        KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, 1L, 1L,
                 serverAddress, topicName);
 
         new MockUp<KafkaRoutineLoadJob>() {
@@ -112,7 +127,7 @@ public class RoutineLoadManagerTest {
 
         new Expectations() {
             {
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
                 auth.checkTblPriv((ConnectContext) any, anyString, anyString, PrivPredicate.LOAD);
@@ -147,7 +162,7 @@ public class RoutineLoadManagerTest {
     public void testCreateJobAuthDeny(@Injectable Auth auth,
                                       @Injectable TResourceInfo tResourceInfo,
                                       @Mocked ConnectContext connectContext,
-                                      @Mocked Catalog catalog) {
+                                      @Mocked GlobalStateMgr globalStateMgr) {
         String jobName = "job1";
         String dbName = "db1";
         LabelName labelName = new LabelName(dbName, jobName);
@@ -171,7 +186,7 @@ public class RoutineLoadManagerTest {
 
         new Expectations() {
             {
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
                 auth.checkTblPriv((ConnectContext) any, anyString, anyString, PrivPredicate.LOAD);
@@ -197,7 +212,7 @@ public class RoutineLoadManagerTest {
         String jobName = "job1";
         String topicName = "topic1";
         String serverAddress = "http://127.0.0.1:8080";
-        KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, "default_cluster", 1L, 1L,
+        KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, 1L, 1L,
                 serverAddress, topicName);
 
         RoutineLoadManager routineLoadManager = new RoutineLoadManager();
@@ -205,7 +220,7 @@ public class RoutineLoadManagerTest {
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newConcurrentMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newConcurrentMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
-        KafkaRoutineLoadJob kafkaRoutineLoadJobWithSameName = new KafkaRoutineLoadJob(1L, jobName, "default_cluster",
+        KafkaRoutineLoadJob kafkaRoutineLoadJobWithSameName = new KafkaRoutineLoadJob(1L, jobName,
                 1L, 1L, serverAddress, topicName);
         routineLoadJobList.add(kafkaRoutineLoadJobWithSameName);
         nameToRoutineLoadJob.put(jobName, routineLoadJobList);
@@ -222,19 +237,19 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testCreateWithSameNameOfStoppedJob(@Mocked ConnectContext connectContext,
-                                                   @Mocked Catalog catalog,
+                                                   @Mocked GlobalStateMgr globalStateMgr,
                                                    @Mocked EditLog editLog) throws DdlException {
         String jobName = "job1";
         String topicName = "topic1";
         String serverAddress = "http://127.0.0.1:8080";
-        KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, "default_cluster", 1L, 1L,
+        KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, 1L, 1L,
                 serverAddress, topicName);
 
         RoutineLoadManager routineLoadManager = new RoutineLoadManager();
 
         new Expectations() {
             {
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
             }
@@ -243,7 +258,7 @@ public class RoutineLoadManagerTest {
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newConcurrentMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newConcurrentMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
-        KafkaRoutineLoadJob kafkaRoutineLoadJobWithSameName = new KafkaRoutineLoadJob(1L, jobName, "default_cluster",
+        KafkaRoutineLoadJob kafkaRoutineLoadJobWithSameName = new KafkaRoutineLoadJob(1L, jobName,
                 1L, 1L, serverAddress, topicName);
         Deencapsulation.setField(kafkaRoutineLoadJobWithSameName, "state", RoutineLoadJob.JobState.STOPPED);
         routineLoadJobList.add(kafkaRoutineLoadJobWithSameName);
@@ -279,7 +294,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        new MockUp<Catalog>() {
+        new MockUp<GlobalStateMgr>() {
             public SystemInfoService getCurrentSystemInfo() {
                 return systemInfoService;
             }
@@ -305,7 +320,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        new MockUp<Catalog>() {
+        new MockUp<GlobalStateMgr>() {
             public SystemInfoService getCurrentSystemInfo() {
                 return systemInfoService;
             }
@@ -425,7 +440,7 @@ public class RoutineLoadManagerTest {
     public void testGetJobIncludeHistory(@Injectable RoutineLoadJob routineLoadJob1,
                                          @Injectable RoutineLoadJob routineLoadJob2,
                                          @Injectable RoutineLoadJob routineLoadJob3,
-                                         @Mocked Catalog catalog,
+                                         @Mocked GlobalStateMgr globalStateMgr,
                                          @Mocked Database database) throws MetaNotFoundException {
         new Expectations() {
             {
@@ -438,7 +453,7 @@ public class RoutineLoadManagerTest {
                 routineLoadJob3.isFinal();
                 minTimes = 0;
                 result = true;
-                catalog.getDb(anyString);
+                globalStateMgr.getDb(anyString);
                 minTimes = 0;
                 result = database;
                 database.getId();
@@ -467,7 +482,7 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testPauseRoutineLoadJob(@Injectable PauseRoutineLoadStmt pauseRoutineLoadStmt,
-                                        @Mocked Catalog catalog,
+                                        @Mocked GlobalStateMgr globalStateMgr,
                                         @Mocked Database database,
                                         @Mocked Auth auth,
                                         @Mocked ConnectContext connectContext) throws UserException {
@@ -493,13 +508,13 @@ public class RoutineLoadManagerTest {
                 pauseRoutineLoadStmt.getName();
                 minTimes = 0;
                 result = "";
-                catalog.getDb("");
+                globalStateMgr.getDb("");
                 minTimes = 0;
                 result = database;
                 database.getId();
                 minTimes = 0;
                 result = 1L;
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
                 auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
@@ -529,7 +544,7 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testResumeRoutineLoadJob(@Injectable ResumeRoutineLoadStmt resumeRoutineLoadStmt,
-                                         @Mocked Catalog catalog,
+                                         @Mocked GlobalStateMgr globalStateMgr,
                                          @Mocked Database database,
                                          @Mocked Auth auth,
                                          @Mocked ConnectContext connectContext) throws UserException {
@@ -551,13 +566,13 @@ public class RoutineLoadManagerTest {
                 resumeRoutineLoadStmt.getName();
                 minTimes = 0;
                 result = "";
-                catalog.getDb("");
+                globalStateMgr.getDb("");
                 minTimes = 0;
                 result = database;
                 database.getId();
                 minTimes = 0;
                 result = 1L;
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
                 auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
@@ -573,7 +588,7 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testStopRoutineLoadJob(@Injectable StopRoutineLoadStmt stopRoutineLoadStmt,
-                                       @Mocked Catalog catalog,
+                                       @Mocked GlobalStateMgr globalStateMgr,
                                        @Mocked Database database,
                                        @Mocked Auth auth,
                                        @Mocked ConnectContext connectContext) throws UserException {
@@ -595,13 +610,13 @@ public class RoutineLoadManagerTest {
                 stopRoutineLoadStmt.getName();
                 minTimes = 0;
                 result = "";
-                catalog.getDb("");
+                globalStateMgr.getDb("");
                 minTimes = 0;
                 result = database;
                 database.getId();
                 minTimes = 0;
                 result = 1L;
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
                 auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
@@ -617,7 +632,7 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testCleanOldRoutineLoadJobs(@Injectable RoutineLoadJob routineLoadJob,
-                                            @Mocked Catalog catalog,
+                                            @Mocked GlobalStateMgr globalStateMgr,
                                             @Mocked EditLog editLog) {
         RoutineLoadManager routineLoadManager = new RoutineLoadManager();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
@@ -642,7 +657,7 @@ public class RoutineLoadManagerTest {
                 routineLoadJob.getName();
                 minTimes = 0;
                 result = "";
-                catalog.getEditLog();
+                globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
             }
@@ -720,7 +735,7 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testAlterRoutineLoadJob(@Injectable StopRoutineLoadStmt stopRoutineLoadStmt,
-                                        @Mocked Catalog catalog,
+                                        @Mocked GlobalStateMgr globalStateMgr,
                                         @Mocked Database database,
                                         @Mocked Auth auth,
                                         @Mocked ConnectContext connectContext) throws UserException {
@@ -742,13 +757,13 @@ public class RoutineLoadManagerTest {
                 stopRoutineLoadStmt.getName();
                 minTimes = 0;
                 result = "";
-                catalog.getDb("");
+                globalStateMgr.getDb("");
                 minTimes = 0;
                 result = database;
                 database.getId();
                 minTimes = 0;
                 result = 1L;
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
                 auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
@@ -760,5 +775,62 @@ public class RoutineLoadManagerTest {
         routineLoadManager.stopRoutineLoadJob(stopRoutineLoadStmt);
 
         Assert.assertEquals(RoutineLoadJob.JobState.STOPPED, routineLoadJob.getState());
+    }
+
+
+    @Test
+    public void testLoadImageWithoutExpiredJob() throws Exception {
+        UtFrameUtils.setUpForPersistTest();
+
+        Config.label_keep_max_second = 10;
+        Config.enable_dict_optimize_routine_load = true;
+        ConnectContext connectContext = new ConnectContext();
+        connectContext.setCurrentUserIdentity(UserIdentity.ROOT);
+        connectContext.setThreadLocalInfo();
+        String db = "test";
+        String createSQL = "CREATE ROUTINE LOAD db0.routine_load_0 ON t1 " +
+                "PROPERTIES(\"format\" = \"json\",\"jsonpaths\"=\"[\\\"$.k1\\\",\\\"$.k2.\\\\\\\"k2.1\\\\\\\"\\\"]\") " +
+                "FROM KAFKA(\"kafka_broker_list\" = \"xxx.xxx.xxx.xxx:xxx\",\"kafka_topic\" = \"topic_0\");";
+
+        RoutineLoadManager leaderLoadManager = new RoutineLoadManager();
+        long now = System.currentTimeMillis();
+
+        // 1. create a job that will be discard after image load
+        long discardJobId = 1L;
+        RoutineLoadJob discardJob = new KafkaRoutineLoadJob(discardJobId, "discardJob",
+                1, 1, "xxx", "xxtopic");
+        discardJob.setOrigStmt(new OriginStatement(createSQL, 0));
+        leaderLoadManager.addRoutineLoadJob(discardJob, db);
+        discardJob.updateState(RoutineLoadJob.JobState.CANCELLED,
+                new ErrorReason(InternalErrorCode.CREATE_TASKS_ERR, "fake"), false);
+        discardJob.endTimestamp = now - Config.label_keep_max_second * 2 * 1000L;
+
+        // 2. create a new job that will keep for a while
+        long goodJobId = 2L;
+        RoutineLoadJob goodJob = new KafkaRoutineLoadJob(goodJobId, "goodJob",
+                1, 1, "xxx", "xxtopic");
+        goodJob.setOrigStmt(new OriginStatement(createSQL, 0));
+        leaderLoadManager.addRoutineLoadJob(goodJob, db);
+        goodJob.updateState(RoutineLoadJob.JobState.CANCELLED,
+                new ErrorReason(InternalErrorCode.CREATE_TASKS_ERR, "fake"), false);
+        Assert.assertNotNull(leaderLoadManager.getJob(discardJobId));
+        Assert.assertNotNull(leaderLoadManager.getJob(goodJobId));
+
+        // 3. save image & reload
+        UtFrameUtils.PseudoImage pseudoImage = new UtFrameUtils.PseudoImage();
+        leaderLoadManager.write(pseudoImage.getDataOutputStream());
+        RoutineLoadManager restartedRoutineLoadManager = new RoutineLoadManager();
+        restartedRoutineLoadManager.readFields(pseudoImage.getDataInputStream());
+        // discard expired job
+        Assert.assertNull(restartedRoutineLoadManager.getJob(discardJobId));
+        Assert.assertNotNull(restartedRoutineLoadManager.getJob(goodJobId));
+
+        // 4. clean expire
+        leaderLoadManager.cleanOldRoutineLoadJobs();
+        // discard expired job
+        Assert.assertNull(leaderLoadManager.getJob(discardJobId));
+        Assert.assertNotNull(leaderLoadManager.getJob(goodJobId));
+
+        UtFrameUtils.tearDownForPersisTest();
     }
 }

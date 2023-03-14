@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/clone/ClusterLoadStatisticsTest.java
 
@@ -23,12 +36,12 @@ package com.starrocks.clone;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.DiskInfo;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Replica.ReplicaState;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletMeta;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TStorageMedium;
@@ -45,7 +58,7 @@ public class ClusterLoadStatisticsTest {
     private Backend be2;
     private Backend be3;
 
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     private SystemInfoService systemInfoService;
     private TabletInvertedIndex invertedIndex;
 
@@ -74,7 +87,6 @@ public class ClusterLoadStatisticsTest {
 
         be1.setDisks(ImmutableMap.copyOf(disks));
         be1.setAlive(true);
-        be1.setOwnerClusterName(SystemInfoService.DEFAULT_CLUSTER);
 
         // be2
         be2 = new Backend(10002, "192.168.0.2", 9052);
@@ -93,7 +105,6 @@ public class ClusterLoadStatisticsTest {
 
         be2.setDisks(ImmutableMap.copyOf(disks));
         be2.setAlive(true);
-        be2.setOwnerClusterName(SystemInfoService.DEFAULT_CLUSTER);
 
         // be3
         be3 = new Backend(10003, "192.168.0.3", 9053);
@@ -118,7 +129,6 @@ public class ClusterLoadStatisticsTest {
 
         be3.setDisks(ImmutableMap.copyOf(disks));
         be3.setAlive(true);
-        be3.setOwnerClusterName(SystemInfoService.DEFAULT_CLUSTER);
 
         systemInfoService = new SystemInfoService();
         systemInfoService.addBackend(be1);
@@ -144,8 +154,7 @@ public class ClusterLoadStatisticsTest {
 
     @Test
     public void test() {
-        ClusterLoadStatistic loadStatistic = new ClusterLoadStatistic(SystemInfoService.DEFAULT_CLUSTER,
-                systemInfoService, invertedIndex);
+        ClusterLoadStatistic loadStatistic = new ClusterLoadStatistic(systemInfoService, invertedIndex);
         loadStatistic.init();
         List<List<String>> infos = loadStatistic.getClusterStatistic(TStorageMedium.HDD);
         System.out.println(infos);

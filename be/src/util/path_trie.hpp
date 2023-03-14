@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/util/path_trie.hpp
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -24,19 +20,16 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace starrocks {
 
 // This tree is usd for manage restful api path.
-template<class T>
+template <class T>
 class PathTrie {
 public:
-    PathTrie() :
-            _root("/", "*"),
-            _root_value(nullptr),
-            _separator('/') {
-    };
+    PathTrie() : _root("/", "*"), _root_value(nullptr){};
 
     ~PathTrie() {
         if (_root_value != nullptr) {
@@ -47,17 +40,14 @@ public:
 
     class TrieNode {
     public:
-        TrieNode(const std::string& key, const std::string& wildcard) :
-                _value(nullptr), 
-                _wildcard(wildcard) {
+        TrieNode(const std::string& key, std::string wildcard) : _value(nullptr), _wildcard(std::move(wildcard)) {
             if (is_named_wildcard(key)) {
                 _named_wildcard = extract_template(key);
             }
         }
 
-        TrieNode(const std::string& key, const T& value, const std::string& wildcard) :
-                _value(nullptr),
-                _wildcard(wildcard) {
+        TrieNode(const std::string& key, const T& value, std::string wildcard)
+                : _value(nullptr), _wildcard(std::move(wildcard)) {
             _value = _allocator.allocate(1);
             _allocator.construct(_value, value);
             if (is_named_wildcard(key)) {
@@ -104,8 +94,7 @@ public:
                 // If this is a template, set this to the node
                 if (is_named_wildcard(token)) {
                     std::string temp = extract_template(token);
-                    if (node->_named_wildcard.empty() 
-                            || node->_named_wildcard.compare(temp) == 0) {
+                    if (node->_named_wildcard.empty() || node->_named_wildcard.compare(temp) == 0) {
                         node->_named_wildcard = temp;
                     } else {
                         // Duplicated
@@ -125,8 +114,8 @@ public:
             return node->insert(path, index + 1, value);
         }
 
-        bool retrieve(const std::vector<std::string> path, int index, 
-                      T* value, std::map<std::string, std::string>* params) {
+        bool retrieve(const std::vector<std::string> path, int index, T* value,
+                      std::map<std::string, std::string>* params) {
             // check max index
             if (index >= path.size()) {
                 return false;
@@ -136,15 +125,13 @@ public:
             TrieNode* node = get_child(token);
             if (node == nullptr) {
                 node = get_child(_wildcard);
-                if (node ==  nullptr) {
+                if (node == nullptr) {
                     return false;
                 }
                 use_wildcard = true;
             } else {
                 // If we the last one, but we have no value, check wildcard
-                if (index == path.size() - 1 
-                        && node->_value == nullptr 
-                        && get_child(_wildcard) != nullptr) {
+                if (index == path.size() - 1 && node->_value == nullptr && get_child(_wildcard) != nullptr) {
                     node = get_child(_wildcard);
                     use_wildcard = true;
                 } else {
@@ -177,10 +164,10 @@ public:
             }
             return false;
         }
+
     private:
         bool is_named_wildcard(const std::string& key) {
-            if (key.find('{') != std::string::npos 
-                    && key.find('}') != std::string::npos) {
+            if (key.find('{') != std::string::npos && key.find('}') != std::string::npos) {
                 return true;
             }
             return false;
@@ -200,8 +187,7 @@ public:
             return pair->second;
         }
 
-        void put(std::map<std::string, std::string>* params, 
-                TrieNode* node, const std::string& token) {
+        void put(std::map<std::string, std::string>* params, TrieNode* node, const std::string& token) {
             if (params != nullptr && !node->_named_wildcard.empty()) {
                 params->insert(std::make_pair(node->_named_wildcard, token));
             }
@@ -233,12 +219,9 @@ public:
         return _root.insert(path_array, index, value);
     }
 
-    bool retrieve(const std::string& path, T* value) {
-        return retrieve(path, value, nullptr);
-    }
+    bool retrieve(const std::string& path, T* value) { return retrieve(path, value, nullptr); }
 
-    bool retrieve(const std::string& path, T* value, 
-                  std::map<std::string, std::string>* params) {
+    bool retrieve(const std::string& path, T* value, std::map<std::string, std::string>* params) {
         if (path.empty()) {
             if (_root_value == nullptr) {
                 return false;
@@ -284,8 +267,8 @@ private:
 
     TrieNode _root;
     T* _root_value;
-    char _separator;
+    char _separator{'/'};
     std::allocator<T> _allocator;
 };
 
-}
+} // namespace starrocks

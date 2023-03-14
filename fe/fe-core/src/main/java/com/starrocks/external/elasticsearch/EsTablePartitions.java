@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/external/elasticsearch/EsTablePartitions.java
 
@@ -30,7 +43,6 @@ import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.common.DdlException;
-import com.starrocks.thrift.TNetworkAddress;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -38,7 +50,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 
 /**
  * save the dynamic info parsed from es cluster state such as shard routing, partition info
@@ -110,22 +121,6 @@ public class EsTablePartitions {
             }
         }
         return esTablePartitions;
-    }
-
-    public void addHttpAddress(Map<String, EsNodeInfo> nodesInfo) {
-        for (EsShardPartitions indexState : partitionedIndexStates.values()) {
-            indexState.addHttpAddress(nodesInfo);
-        }
-        for (EsShardPartitions indexState : unPartitionedIndexStates.values()) {
-            indexState.addHttpAddress(nodesInfo);
-        }
-
-    }
-
-    public TNetworkAddress randomAddress(Map<String, EsNodeInfo> nodesInfo) {
-        int seed = new Random().nextInt() % nodesInfo.size();
-        EsNodeInfo[] nodeInfos = (EsNodeInfo[]) nodesInfo.values().toArray();
-        return nodeInfos[seed].getPublishAddress();
     }
 
     public PartitionInfo getPartitionInfo() {

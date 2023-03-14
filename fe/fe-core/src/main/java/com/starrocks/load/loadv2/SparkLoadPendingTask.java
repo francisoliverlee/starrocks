@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/loadv2/SparkLoadPendingTask.java
 
@@ -27,16 +40,16 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.BrokerDesc;
+import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
-import com.starrocks.analysis.ImportColumnDesc;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.catalog.AggregateType;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.DistributionInfo.DistributionInfoType;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.HiveTable;
 import com.starrocks.catalog.KeysType;
@@ -51,6 +64,7 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.LoadException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
+import com.starrocks.common.util.LoadPriority;
 import com.starrocks.load.BrokerFileGroup;
 import com.starrocks.load.BrokerFileGroupAggInfo.FileGroupAggKey;
 import com.starrocks.load.FailMsg;
@@ -66,6 +80,11 @@ import com.starrocks.load.loadv2.etl.EtlJobConfig.EtlPartitionInfo;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.EtlTable;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.FilePatternVersion;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.SourceType;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.ImportColumnDesc;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.transaction.TransactionState;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -92,7 +111,7 @@ public class SparkLoadPendingTask extends LoadTask {
     public SparkLoadPendingTask(SparkLoadJob loadTaskCallback,
                                 Map<FileGroupAggKey, List<BrokerFileGroup>> aggKeyToBrokerFileGroups,
                                 SparkResource resource, BrokerDesc brokerDesc) {
-        super(loadTaskCallback, TaskType.PENDING);
+        super(loadTaskCallback, TaskType.PENDING, LoadPriority.NORMAL_VALUE);
         this.retryTime = 3;
         this.attachment = new SparkPendingTaskAttachment(signature);
         this.aggKeyToBrokerFileGroups = aggKeyToBrokerFileGroups;
@@ -131,7 +150,7 @@ public class SparkLoadPendingTask extends LoadTask {
     }
 
     private void createEtlJobConf() throws LoadException {
-        Database db = Catalog.getCurrentCatalog().getDb(dbId);
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
         if (db == null) {
             throw new LoadException("db does not exist. id: " + dbId);
         }
@@ -165,7 +184,7 @@ public class SparkLoadPendingTask extends LoadTask {
                     tables.put(tableId, etlTable);
 
                     // add table indexes to transaction state
-                    TransactionState txnState = Catalog.getCurrentGlobalTransactionMgr()
+                    TransactionState txnState = GlobalStateMgr.getCurrentGlobalTransactionMgr()
                             .getTransactionState(dbId, transactionId);
                     if (txnState == null) {
                         throw new LoadException("txn does not exist. id: " + transactionId);
@@ -294,10 +313,15 @@ public class SparkLoadPendingTask extends LoadTask {
 
         // default value
         String defaultValue = null;
-        if (column.getDefaultValue() != null) {
-            defaultValue = column.getDefaultValue();
+        Column.DefaultValueType defaultValueType = column.getDefaultValueType();
+        if (defaultValueType == Column.DefaultValueType.VARY) {
+            throw new SemanticException("Column " + column.getName() + " has unsupported default value:" +
+                    column.getDefaultExpr().getExpr());
         }
-        if (column.isAllowNull() && column.getDefaultValue() == null) {
+        if (defaultValueType == Column.DefaultValueType.CONST) {
+            defaultValue = column.calculatedDefaultValue();
+        }
+        if (column.isAllowNull() && defaultValueType == Column.DefaultValueType.NULL) {
             defaultValue = "\\N";
         }
 
@@ -346,17 +370,28 @@ public class SparkLoadPendingTask extends LoadTask {
                 // bucket num
                 int bucketNum = partition.getDistributionInfo().getBucketNum();
 
-                // is max partition
+                // is min|max partition
                 Range<PartitionKey> range = entry.getValue();
                 boolean isMaxPartition = range.upperEndpoint().isMaxValue();
+                boolean isMinPartition = range.lowerEndpoint().isMinValue();
 
                 // start keys
-                List<LiteralExpr> rangeKeyExprs = range.lowerEndpoint().getKeys();
+                List<LiteralExpr> rangeKeyExprs = null;
                 List<Object> startKeys = Lists.newArrayList();
-                for (int i = 0; i < rangeKeyExprs.size(); ++i) {
-                    LiteralExpr literalExpr = rangeKeyExprs.get(i);
-                    Object keyValue = literalExpr.getRealValue();
-                    startKeys.add(keyValue);
+                if (!isMinPartition) {
+                    rangeKeyExprs = range.lowerEndpoint().getKeys();
+                    for (int i = 0; i < rangeKeyExprs.size(); ++i) {
+                        LiteralExpr literalExpr = rangeKeyExprs.get(i);
+
+                        Object keyValue;
+                        if (literalExpr instanceof DateLiteral) {
+                            keyValue = convertDateLiteralToNumber((DateLiteral) literalExpr);
+                        } else {
+                            keyValue = literalExpr.getRealObjectValue();
+                        }
+
+                        startKeys.add(keyValue);
+                    }
                 }
 
                 // end keys
@@ -366,12 +401,18 @@ public class SparkLoadPendingTask extends LoadTask {
                     rangeKeyExprs = range.upperEndpoint().getKeys();
                     for (int i = 0; i < rangeKeyExprs.size(); ++i) {
                         LiteralExpr literalExpr = rangeKeyExprs.get(i);
-                        Object keyValue = literalExpr.getRealValue();
+
+                        Object keyValue;
+                        if (literalExpr instanceof DateLiteral) {
+                            keyValue = convertDateLiteralToNumber((DateLiteral) literalExpr);
+                        } else {
+                            keyValue = literalExpr.getRealObjectValue();
+                        }
                         endKeys.add(keyValue);
                     }
                 }
 
-                etlPartitions.add(new EtlPartition(partitionId, startKeys, endKeys, isMaxPartition, bucketNum));
+                etlPartitions.add(new EtlPartition(partitionId, startKeys, endKeys, isMinPartition, isMaxPartition, bucketNum));
             }
         } else {
             Preconditions.checkState(type == PartitionType.UNPARTITIONED);
@@ -387,7 +428,7 @@ public class SparkLoadPendingTask extends LoadTask {
                 int bucketNum = partition.getDistributionInfo().getBucketNum();
 
                 etlPartitions.add(new EtlPartition(partitionId, Lists.newArrayList(), Lists.newArrayList(),
-                        true, bucketNum));
+                        true, true, bucketNum));
             }
         }
 
@@ -526,7 +567,7 @@ public class SparkLoadPendingTask extends LoadTask {
         }
         FunctionCallExpr fn = (FunctionCallExpr) expr;
         String functionName = fn.getFnName().getFunction();
-        if (!functionName.equalsIgnoreCase("hll_hash")
+        if (!functionName.equalsIgnoreCase(FunctionSet.HLL_HASH)
                 && !functionName.equalsIgnoreCase("hll_empty")) {
             throw new LoadException(msg);
         }
@@ -544,14 +585,30 @@ public class SparkLoadPendingTask extends LoadTask {
         }
         FunctionCallExpr fn = (FunctionCallExpr) expr;
         String functionName = fn.getFnName().getFunction();
-        if (!functionName.equalsIgnoreCase("to_bitmap")
-                && !functionName.equalsIgnoreCase("bitmap_hash")
-                && !functionName.equalsIgnoreCase("bitmap_dict")) {
+        if (!functionName.equalsIgnoreCase(FunctionSet.TO_BITMAP)
+                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_HASH)
+                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_DICT)) {
             throw new LoadException(msg);
         }
 
         if (functionName.equalsIgnoreCase("bitmap_dict") && !isLoadFromTable) {
             throw new LoadException("Bitmap global dict should load data from hive table");
+        }
+    }
+
+    // This is to be compatible with Spark Load Job formats for Date type.
+    // Because the historical version is serialized and deserialized with a special hash number for DateLiteral,
+    // special processing is also done here for DateLiteral to keep the historical version compatible.
+    // The deserialized code is in "SparkDpp.createPartitionRangeKeys"
+    public static Object convertDateLiteralToNumber(DateLiteral dateLiteral) {
+        if (dateLiteral.getType().isDate()) {
+            return (dateLiteral.getYear() * 16 * 32L
+                    + dateLiteral.getMonth() * 32
+                    + dateLiteral.getDay());
+        } else if (dateLiteral.getType().isDatetime()) {
+            return dateLiteral.getLongValue();
+        } else {
+            throw new StarRocksPlannerException("Invalid date type: " + dateLiteral.getType(), ErrorType.INTERNAL_ERROR);
         }
     }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/HttpServerHandler.java
 
@@ -27,6 +40,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
@@ -37,8 +51,6 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.util.ReferenceCountUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-
-import java.net.URISyntaxException;
 
 public class HttpServerHandler extends ChannelInboundHandlerAdapter {
     private static final Logger LOG = LogManager.getLogger(HttpServerHandler.class);
@@ -62,16 +74,22 @@ public class HttpServerHandler extends ChannelInboundHandlerAdapter {
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof HttpRequest) {
             this.request = (HttpRequest) msg;
-            LOG.debug("request: url:[{}]", request.uri());
-            if (!isRequestValid(ctx, request)) {
-                writeResponse(ctx, HttpResponseStatus.BAD_REQUEST, "this is a bad request.");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("request: url:[{}]", request.uri());
+            }
+            try {
+                validateRequest(ctx, request);
+            } catch (Exception e) {
+                LOG.warn("accept bad request: {}, error: {}", request.uri(), e.getMessage(), e);
+                writeResponse(ctx, HttpResponseStatus.BAD_REQUEST, "Bad Request. <br/> " + e.getMessage());
                 return;
             }
             BaseRequest req = new BaseRequest(ctx, request);
-
             action = getAction(req);
             if (action != null) {
-                LOG.debug("action: {} ", action.getClass().getName());
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("action: {} ", action.getClass().getName());
+                }
                 action.handleRequest(req);
             }
         } else {
@@ -79,8 +97,11 @@ public class HttpServerHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private boolean isRequestValid(ChannelHandlerContext ctx, HttpRequest request) throws URISyntaxException {
-        return true;
+    private void validateRequest(ChannelHandlerContext ctx, HttpRequest request) {
+        DecoderResult decoderResult = request.decoderResult();
+        if (decoderResult.isFailure()) {
+            throw new HttpRequestException(decoderResult.cause().getMessage());
+        }
     }
 
     private void writeResponse(ChannelHandlerContext context, HttpResponseStatus status, String content) {
@@ -95,7 +116,7 @@ public class HttpServerHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        cause.printStackTrace();
+        LOG.warn(cause);
         ctx.close();
     }
 

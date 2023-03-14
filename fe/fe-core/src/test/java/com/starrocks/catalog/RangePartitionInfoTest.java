@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/RangePartitionInfoTest.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -22,12 +18,12 @@
 package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.PartitionKeyDesc;
-import com.starrocks.analysis.PartitionKeyDesc.PartitionRangeType;
-import com.starrocks.analysis.PartitionValue;
-import com.starrocks.analysis.SingleRangePartitionDesc;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.sql.ast.PartitionKeyDesc;
+import com.starrocks.sql.ast.PartitionKeyDesc.PartitionRangeType;
+import com.starrocks.sql.ast.PartitionValue;
+import com.starrocks.sql.ast.SingleRangePartitionDesc;
 import org.junit.Before;
 import org.junit.Test;
 

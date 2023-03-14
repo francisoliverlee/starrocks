@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/loadv2/BrokerLoadJob.java
 
@@ -24,18 +37,19 @@ package com.starrocks.load.loadv2;
 import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BrokerDesc;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.DataQualityException;
+import com.starrocks.common.DdlException;
 import com.starrocks.common.DuplicatedRequestException;
 import com.starrocks.common.LabelAlreadyUsedException;
 import com.starrocks.common.LoadException;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.UserException;
+import com.starrocks.common.util.LoadPriority;
 import com.starrocks.common.util.LogBuilder;
 import com.starrocks.common.util.LogKey;
 import com.starrocks.load.BrokerFileGroup;
@@ -45,8 +59,14 @@ import com.starrocks.load.FailMsg;
 import com.starrocks.metric.MetricRepo;
 import com.starrocks.metric.TableMetricsEntity;
 import com.starrocks.metric.TableMetricsRegistry;
+import com.starrocks.persist.AlterLoadJobOperationLog;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.OriginStatement;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.sql.ast.AlterLoadStmt;
+import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.thrift.TLoadJobType;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.BeginTransactionException;
 import com.starrocks.transaction.TransactionState;
@@ -58,7 +78,6 @@ import org.apache.logging.log4j.Logger;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.RejectedExecutionException;
 
 /**
  * There are 3 steps in BrokerLoadJob: BrokerPendingTask, LoadLoadingTask, CommitAndPublishTxn.
@@ -69,6 +88,8 @@ import java.util.concurrent.RejectedExecutionException;
 public class BrokerLoadJob extends BulkLoadJob {
 
     private static final Logger LOG = LogManager.getLogger(BrokerLoadJob.class);
+    private ConnectContext context;
+    private List<LoadLoadingTask> newLoadingTasks = Lists.newArrayList();
 
     // only for log replay
     public BrokerLoadJob() {
@@ -76,19 +97,20 @@ public class BrokerLoadJob extends BulkLoadJob {
         this.jobType = EtlJobType.BROKER;
     }
 
-    public BrokerLoadJob(long dbId, String label, BrokerDesc brokerDesc, OriginStatement originStmt)
+    public BrokerLoadJob(long dbId, String label, BrokerDesc brokerDesc, OriginStatement originStmt, ConnectContext context)
             throws MetaNotFoundException {
         super(dbId, label, originStmt);
         this.timeoutSecond = Config.broker_load_default_timeout_second;
         this.brokerDesc = brokerDesc;
         this.jobType = EtlJobType.BROKER;
+        this.context = context;
     }
 
     @Override
     public void beginTxn()
             throws LabelAlreadyUsedException, BeginTransactionException, AnalysisException, DuplicatedRequestException {
         MetricRepo.COUNTER_LOAD_ADD.increase(1L);
-        transactionId = Catalog.getCurrentGlobalTransactionMgr()
+        transactionId = GlobalStateMgr.getCurrentGlobalTransactionMgr()
                 .beginTransaction(dbId, Lists.newArrayList(fileGroupAggInfo.getAllTableIds()), label, null,
                         new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
                         TransactionState.LoadJobSourceType.BATCH_LOAD_JOB, id,
@@ -96,10 +118,41 @@ public class BrokerLoadJob extends BulkLoadJob {
     }
 
     @Override
+    public void alterJob(AlterLoadStmt stmt) throws DdlException {
+        writeLock();
+
+        try {
+            if (stmt.getAnalyzedJobProperties().containsKey(LoadStmt.PRIORITY)) {
+                priority = LoadPriority.priorityByName(stmt.getAnalyzedJobProperties().get(LoadStmt.PRIORITY));
+                AlterLoadJobOperationLog log = new AlterLoadJobOperationLog(id,
+                        stmt.getAnalyzedJobProperties());
+                GlobalStateMgr.getCurrentState().getEditLog().logAlterLoadJob(log);
+
+                for (LoadTask loadTask : newLoadingTasks) {
+                    GlobalStateMgr.getCurrentState().getLoadingLoadTaskScheduler().updatePriority(
+                            loadTask.getSignature(),
+                            priority);
+                }
+            }
+
+        } finally {
+            writeUnlock();
+        }
+
+    }
+
+    @Override
+    public void replayAlterJob(AlterLoadJobOperationLog log) {
+        if (log.getJobProperties().containsKey(LoadStmt.PRIORITY)) {
+            priority = LoadPriority.priorityByName(log.getJobProperties().get(LoadStmt.PRIORITY));
+        }
+    }
+
+    @Override
     protected void unprotectedExecuteJob() throws LoadException {
         LoadTask task = new BrokerLoadPendingTask(this, fileGroupAggInfo.getAggKeyToFileGroups(), brokerDesc);
         idToTasks.put(task.getSignature(), task);
-        submitTask(Catalog.getCurrentCatalog().getPendingLoadTaskScheduler(), task);
+        submitTask(GlobalStateMgr.getCurrentState().getPendingLoadTaskScheduler(), task);
     }
 
     /**
@@ -156,28 +209,18 @@ public class BrokerLoadJob extends BulkLoadJob {
         try {
             Database db = getDb();
             createLoadingTask(db, attachment);
-        } catch (UserException e) {
+        } catch (Exception e) {
             LOG.warn(new LogBuilder(LogKey.LOAD_JOB, id)
                     .add("database_id", dbId)
                     .add("error_msg", "Failed to divide job into loading task.")
                     .build(), e);
             cancelJobWithoutCheck(new FailMsg(FailMsg.CancelType.ETL_RUN_FAIL, e.getMessage()), true, true);
             return;
-        } catch (RejectedExecutionException e) {
-            LOG.warn(new LogBuilder(LogKey.LOAD_JOB, id)
-                    .add("database_id", dbId)
-                    .add("error_msg", "the task queque is full.")
-                    .build(), e);
-            cancelJobWithoutCheck(new FailMsg(FailMsg.CancelType.ETL_RUN_FAIL, e.getMessage()), true, true);
-            return;
         }
-
-        loadStartTimestamp = System.currentTimeMillis();
     }
 
     private void createLoadingTask(Database db, BrokerPendingTaskAttachment attachment) throws UserException {
         // divide job into broker loading task by table
-        List<LoadLoadingTask> newLoadingTasks = Lists.newArrayList();
         db.readLock();
         try {
             for (Map.Entry<FileGroupAggKey, List<BrokerFileGroup>> entry : fileGroupAggInfo.getAggKeyToFileGroups()
@@ -196,10 +239,13 @@ public class BrokerLoadJob extends BulkLoadJob {
                             + tableId + " not found");
                 }
 
+                String mergeCondition = (brokerDesc == null) ? "" : brokerDesc.getMergeConditionStr();
                 // Generate loading task and init the plan of task
                 LoadLoadingTask task = new LoadLoadingTask(db, table, brokerDesc,
                         brokerFileGroups, getDeadlineMs(), loadMemLimit,
-                        strictMode, transactionId, this, timezone, timeoutSecond);
+                        strictMode, transactionId, this, timezone, timeoutSecond,
+                        createTimestamp, partialUpdate, mergeCondition, sessionVariables,
+                        context,  TLoadJobType.BROKER, priority, originStmt);
                 UUID uuid = UUID.randomUUID();
                 TUniqueId loadId = new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
                 task.init(loadId, attachment.getFileStatusByTable(aggKey), attachment.getFileNumByTable(aggKey));
@@ -211,7 +257,7 @@ public class BrokerLoadJob extends BulkLoadJob {
 
                 // save all related tables and rollups in transaction state
                 TransactionState txnState =
-                        Catalog.getCurrentGlobalTransactionMgr().getTransactionState(dbId, transactionId);
+                        GlobalStateMgr.getCurrentGlobalTransactionMgr().getTransactionState(dbId, transactionId);
                 if (txnState == null) {
                     throw new UserException("txn does not exist: " + transactionId);
                 }
@@ -224,7 +270,7 @@ public class BrokerLoadJob extends BulkLoadJob {
 
         // Submit task outside the database lock, cause it may take a while if task queue is full.
         for (LoadTask loadTask : newLoadingTasks) {
-            submitTask(Catalog.getCurrentCatalog().getLoadingLoadTaskScheduler(), loadTask);
+            submitTask(GlobalStateMgr.getCurrentState().getLoadingLoadTaskScheduler(), loadTask);
         }
     }
 
@@ -290,8 +336,8 @@ public class BrokerLoadJob extends BulkLoadJob {
                     .add("txn_id", transactionId)
                     .add("msg", "Load job try to commit txn")
                     .build());
-            Catalog.getCurrentGlobalTransactionMgr().commitTransaction(
-                    dbId, transactionId, commitInfos,
+            GlobalStateMgr.getCurrentGlobalTransactionMgr().commitTransaction(
+                    dbId, transactionId, commitInfos, failInfos,
                     new LoadJobFinalOperation(id, loadingStatus, progress, loadStartTimestamp,
                             finishTimestamp, state, failMsg));
             MetricRepo.COUNTER_LOAD_FINISHED.increase(1L);
@@ -299,15 +345,15 @@ public class BrokerLoadJob extends BulkLoadJob {
             loadingStatus.travelTableCounters(kv -> {
                 TableMetricsEntity entity = TableMetricsRegistry.getInstance().getMetricsEntity(kv.getKey());
                 if (kv.getValue().containsKey(TableMetricsEntity.TABLE_LOAD_BYTES)) {
-                    entity.COUNTER_BROKER_LOAD_BYTES_TOTAL
+                    entity.counterBrokerLoadBytesTotal
                             .increase(kv.getValue().get(TableMetricsEntity.TABLE_LOAD_BYTES));
                 }
                 if (kv.getValue().containsKey(TableMetricsEntity.TABLE_LOAD_ROWS)) {
-                    entity.COUNTER_BROKER_LOAD_ROWS_TOTAL
+                    entity.counterBrokerLoadRowsTotal
                             .increase(kv.getValue().get(TableMetricsEntity.TABLE_LOAD_ROWS));
                 }
                 if (kv.getValue().containsKey(TableMetricsEntity.TABLE_LOAD_FINISHED)) {
-                    entity.COUNTER_BROKER_LOAD_FINISHED_TOTAL
+                    entity.counterBrokerLoadFinishedTotal
                             .increase(kv.getValue().get(TableMetricsEntity.TABLE_LOAD_FINISHED));
                 }
             });
@@ -334,8 +380,10 @@ public class BrokerLoadJob extends BulkLoadJob {
             loadingStatus.setTrackingUrl(attachment.getTrackingUrl());
         }
         commitInfos.addAll(attachment.getCommitInfoList());
+        failInfos.addAll(attachment.getFailInfoList());
         progress = (int) ((double) finishedTaskIds.size() / idToTasks.size() * 100);
         if (progress == 100) {
+            loadingStatus.getLoadStatistic().setLoadFinish();
             progress = 99;
         }
         // collect table-level metrics
@@ -356,7 +404,25 @@ public class BrokerLoadJob extends BulkLoadJob {
             loadingStatus.increaseTableCounter(tableId, TableMetricsEntity.TABLE_LOAD_BYTES,
                     Long.parseLong(attachment.getCounter(LOADED_BYTES)));
         }
-        loadingStatus.increaseTableCounter(tableId, TableMetricsEntity.TABLE_LOAD_FINISHED, 1l);
+        loadingStatus.increaseTableCounter(tableId, TableMetricsEntity.TABLE_LOAD_FINISHED, 1L);
+    }
+
+    @Override
+    public void updateProgess(Long beId, TUniqueId loadId, TUniqueId fragmentId,
+                              long sinkRows, long sinkBytes, long sourceRows, long sourceBytes, boolean isDone) {
+        writeLock();
+        try {
+            super.updateProgess(beId, loadId, fragmentId, sinkRows, sinkBytes, sourceRows, sourceBytes, isDone);
+            if (!loadingStatus.getLoadStatistic().getLoadFinish()) {
+                progress = (int) ((double) loadingStatus.getLoadStatistic().totalSourceLoadBytes() /
+                        loadingStatus.getLoadStatistic().totalFileSize() * 100);
+                if (progress >= 100) {
+                    progress = 99;
+                }
+            }
+        } finally {
+            writeUnlock();
+        }
     }
 
     private String increaseCounter(String key, String deltaValue) {

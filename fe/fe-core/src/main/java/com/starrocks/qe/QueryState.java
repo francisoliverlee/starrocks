@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/QueryState.java
 
@@ -36,7 +49,7 @@ public class QueryState {
         EOF,    // send EOF packet to remote
         ERR;     // send ERROR packet to remote
 
-        private static final ImmutableMap<String, MysqlStateType> states =
+        private static final ImmutableMap<String, MysqlStateType> STATES =
                 new ImmutableMap.Builder<String, MysqlStateType>()
                         .put("NOOP", NOOP)
                         .put("OK", OK)
@@ -45,7 +58,7 @@ public class QueryState {
                         .build();
 
         public static MysqlStateType fromString(String state) {
-            return states.get(state);
+            return STATES.get(state);
         }
     }
 
@@ -98,6 +111,14 @@ public class QueryState {
     public void setError(String errorMsg) {
         this.stateType = MysqlStateType.ERR;
         this.errorMessage = errorMsg;
+    }
+
+    public boolean isError() {
+        return stateType == MysqlStateType.ERR;
+    }
+
+    public boolean isRunning() {
+        return stateType == MysqlStateType.OK;
     }
 
     public void setStateType(MysqlStateType stateType) {

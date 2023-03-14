@@ -1,22 +1,42 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include <hdfs/hdfs.h>
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "common/status.h"
-#include "gutil/macros.h"
+#include "fs/fs_hdfs.h"
 
 namespace starrocks {
+
+struct HdfsFsHandle {
+    std::string namenode;
+    hdfsFS hdfs_fs;
+};
 
 // Cache for HDFS file system
 class HdfsFsCache {
 public:
-    using HdfsFsMap = std::unordered_map<std::string, hdfsFS>;
+    using HdfsFsMap = std::unordered_map<std::string, HdfsFsHandle>;
 
     static HdfsFsCache* instance() {
         static HdfsFsCache s_instance;
@@ -24,14 +44,15 @@ public:
     }
 
     // This function is thread-safe
-    Status get_connection(const std::string& path, hdfsFS* fs, HdfsFsMap* map = nullptr);
+    Status get_connection(const std::string& namenode, HdfsFsHandle* handle, const FSOptions& options);
 
 private:
     std::mutex _lock;
     HdfsFsMap _cache;
 
-    HdfsFsCache() {}
-    DISALLOW_COPY_AND_ASSIGN(HdfsFsCache);
+    HdfsFsCache() = default;
+    HdfsFsCache(const HdfsFsCache&) = delete;
+    const HdfsFsCache& operator=(const HdfsFsCache&) = delete;
 };
 
 } // namespace starrocks

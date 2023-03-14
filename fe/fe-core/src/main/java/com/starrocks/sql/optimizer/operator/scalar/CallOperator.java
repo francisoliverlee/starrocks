@@ -1,8 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.operator.scalar;
 
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.catalog.AggregateFunction;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
@@ -13,7 +26,6 @@ import com.starrocks.sql.optimizer.operator.OperatorType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import static java.util.Objects.requireNonNull;
@@ -36,6 +48,9 @@ public class CallOperator extends ScalarOperator {
     // The flag for distinct function
     private final boolean isDistinct;
 
+    // Ignore nulls.
+    private boolean ignoreNulls = false;
+
     public CallOperator(String fnName, Type returnType, List<ScalarOperator> arguments) {
         this(fnName, returnType, arguments, null);
     }
@@ -53,6 +68,14 @@ public class CallOperator extends ScalarOperator {
         this.isDistinct = isDistinct;
     }
 
+    public void setIgnoreNulls(boolean ignoreNulls) {
+        this.ignoreNulls = ignoreNulls;
+    }
+
+    public boolean getIgnoreNulls() {
+        return ignoreNulls;
+    }
+
     public String getFnName() {
         return fnName;
     }
@@ -61,12 +84,16 @@ public class CallOperator extends ScalarOperator {
         return fn;
     }
 
+    public List<ScalarOperator> getArguments() {
+        return arguments;
+    }
+
     public boolean isDistinct() {
         return isDistinct;
     }
 
     public boolean isCountStar() {
-        return fnName.equals("count") && arguments.isEmpty();
+        return fnName.equalsIgnoreCase(FunctionSet.COUNT) && arguments.isEmpty();
     }
 
     public boolean isAggregate() {
@@ -81,13 +108,13 @@ public class CallOperator extends ScalarOperator {
 
     @Override
     public String debugString() {
-        if (fnName.equals("add")) {
+        if (fnName.equalsIgnoreCase(FunctionSet.ADD)) {
             return getChild(0).debugString() + " + " + getChild(1).debugString();
-        } else if (fnName.equals("subtract")) {
+        } else if (fnName.equalsIgnoreCase(FunctionSet.SUBTRACT)) {
             return getChild(0).debugString() + " - " + getChild(1).debugString();
-        } else if (fnName.equals("multiply")) {
+        } else if (fnName.equalsIgnoreCase(FunctionSet.MULTIPLY)) {
             return getChild(0).debugString() + " * " + getChild(1).debugString();
-        } else if (fnName.equals("divide")) {
+        } else if (fnName.equalsIgnoreCase(FunctionSet.DIVIDE)) {
             return getChild(0).debugString() + " / " + getChild(1).debugString();
         }
 
@@ -110,24 +137,19 @@ public class CallOperator extends ScalarOperator {
         arguments.set(index, child);
     }
 
-    public static final Set<String> AlwaysReturnNonNullableFunctions =
-            ImmutableSet.<String>builder()
-                    .add(FunctionSet.COUNT)
-                    .add(FunctionSet.MULTI_DISTINCT_COUNT)
-                    .add(FunctionSet.NULL_OR_EMPTY)
-                    .add(FunctionSet.HLL_HASH)
-                    .add(FunctionSet.HLL_UNION_AGG)
-                    .add(FunctionSet.NDV)
-                    .add(FunctionSet.APPROX_COUNT_DISTINCT)
-                    .add(FunctionSet.BITMAP_UNION_INT)
-                    .add(FunctionSet.BITMAP_UNION_COUNT)
-                    .add(FunctionSet.BITMAP_COUNT)
-                    .build();
-
-    // TODO(kks): improve this
     @Override
     public boolean isNullable() {
-        return !AlwaysReturnNonNullableFunctions.contains(fnName);
+        // check if fn always return non null
+        if (fn != null && !fn.isNullable()) {
+            return false;
+        }
+        // check children nullable
+        if (FunctionCallExpr.nullableSameWithChildrenFunctions.contains(fnName)) {
+            // decimal operation may overflow
+            return arguments.stream()
+                    .anyMatch(argument -> argument.isNullable() || argument.getType().isDecimalOfAnyVersion());
+        }
+        return true;
     }
 
     public ColumnRefSet getUsedColumns() {
@@ -140,7 +162,7 @@ public class CallOperator extends ScalarOperator {
 
     @Override
     public int hashCode() {
-        return Objects.hash(fnName, arguments);
+        return Objects.hash(fnName, arguments, isDistinct);
     }
 
     @Override
@@ -152,7 +174,11 @@ public class CallOperator extends ScalarOperator {
             return false;
         }
         CallOperator other = (CallOperator) obj;
-        return Objects.equals(this.fnName, other.fnName) && Objects.equals(this.arguments, other.arguments);
+
+        return isDistinct == other.isDistinct &&
+                Objects.equals(fnName, other.fnName) &&
+                Objects.equals(type, other.type) &&
+                Objects.equals(arguments, other.arguments);
     }
 
     @Override

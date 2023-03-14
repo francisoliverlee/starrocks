@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/mysql/MysqlProtoTest.java
 
@@ -21,13 +34,13 @@
 
 package com.starrocks.mysql;
 
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.DdlException;
 import com.starrocks.mysql.privilege.Auth;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.UserIdentity;
 import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Mocked;
@@ -37,8 +50,8 @@ import org.junit.Test;
 import org.slf4j.Logger;
 
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 public class MysqlProtoTest {
@@ -48,7 +61,7 @@ public class MysqlProtoTest {
     @Mocked
     private MysqlPassword password;
     @Mocked
-    private Catalog catalog;
+    private GlobalStateMgr globalStateMgr;
     @Mocked
     private Auth auth;
 
@@ -74,28 +87,32 @@ public class MysqlProtoTest {
                     }
                 };
 
-                catalog.getDb(anyString);
+                globalStateMgr.getDb(anyString);
                 minTimes = 0;
                 result = new Database();
 
-                catalog.getAuth();
+                globalStateMgr.getAuth();
                 minTimes = 0;
                 result = auth;
 
-                catalog.changeDb((ConnectContext) any, anyString);
+                globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
                 minTimes = 0;
             }
         };
 
-        new Expectations(catalog) {
+        new Expectations(globalStateMgr) {
             {
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
 
-                Catalog.getCurrentCatalog();
+                GlobalStateMgr.getCurrentState();
                 minTimes = 0;
-                result = catalog;
+                result = globalStateMgr;
+
+                globalStateMgr.isUsingNewPrivilege();
+                minTimes = 0;
+                result = false;
             }
         };
 
@@ -204,7 +221,7 @@ public class MysqlProtoTest {
         mockPassword(true);
         mockAccess();
         ConnectContext context = new ConnectContext(null);
-        context.setCatalog(catalog);
+        context.setGlobalStateMgr(globalStateMgr);
         context.setThreadLocalInfo();
         Assert.assertTrue(MysqlProto.negotiate(context));
     }
@@ -215,7 +232,7 @@ public class MysqlProtoTest {
         mockPassword(true);
         mockAccess();
         ConnectContext context = new ConnectContext(null);
-        context.setCatalog(catalog);
+        context.setGlobalStateMgr(globalStateMgr);
         context.setThreadLocalInfo();
         Assert.assertTrue(MysqlProto.negotiate(context));
         ByteBuffer changeUserPacket = mockChangeUserPacket("change-user");
@@ -238,6 +255,7 @@ public class MysqlProtoTest {
         mockPassword(false);
         mockAccess();
         ConnectContext context = new ConnectContext(null);
+        context.setGlobalStateMgr(globalStateMgr);
         Assert.assertTrue(MysqlProto.negotiate(context));
     }
 
@@ -251,7 +269,7 @@ public class MysqlProtoTest {
     }
 
     @Test
-    public void testRead() throws UnsupportedEncodingException {
+    public void testRead() {
         MysqlSerializer serializer = MysqlSerializer.newInstance();
         serializer.writeInt1(200);
         serializer.writeInt2(65535);
@@ -261,7 +279,7 @@ public class MysqlProtoTest {
         serializer.writeInt8(1234567898);
         serializer.writeVInt(1111123452);
         // string
-        serializer.writeBytes("hello".getBytes("utf-8"));
+        serializer.writeBytes("hello".getBytes(StandardCharsets.UTF_8));
         serializer.writeLenEncodedString("world");
         serializer.writeNulTerminateString("i have dream");
         serializer.writeEofString("you have dream too");

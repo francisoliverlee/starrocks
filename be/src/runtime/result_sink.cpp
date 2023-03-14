@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/result_sink.cpp
 
@@ -21,24 +34,27 @@
 
 #include "runtime/result_sink.h"
 
+#include <memory>
+
 #include "common/config.h"
 #include "exprs/expr.h"
 #include "runtime/buffer_control_block.h"
+#include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "runtime/file_result_writer.h"
 #include "runtime/mem_tracker.h"
 #include "runtime/mysql_result_writer.h"
 #include "runtime/result_buffer_mgr.h"
-#include "runtime/row_batch.h"
 #include "runtime/runtime_state.h"
-#include "runtime/vectorized/statistic_result_writer.h"
+#include "runtime/statistic_result_writer.h"
+#include "runtime/variable_result_writer.h"
 #include "util/uid_util.h"
 
 namespace starrocks {
 
 ResultSink::ResultSink(const RowDescriptor& row_desc, const std::vector<TExpr>& t_output_expr, const TResultSink& sink,
                        int buffer_size)
-        : _row_desc(row_desc), _t_output_expr(t_output_expr), _buf_size(buffer_size) {
+        : _t_output_expr(t_output_expr), _buf_size(buffer_size) {
     if (!sink.__isset.type || sink.type == TResultSinkType::MYSQL_PROTOCAL) {
         _sink_type = TResultSinkType::MYSQL_PROTOCAL;
     } else {
@@ -47,15 +63,15 @@ ResultSink::ResultSink(const RowDescriptor& row_desc, const std::vector<TExpr>& 
 
     if (_sink_type == TResultSinkType::FILE) {
         CHECK(sink.__isset.file_options);
-        _file_opts.reset(new ResultFileOptions(sink.file_options));
+        _file_opts = std::make_shared<ResultFileOptions>(sink.file_options);
     }
 }
 
 Status ResultSink::prepare_exprs(RuntimeState* state) {
     // From the thrift expressions create the real exprs.
-    RETURN_IF_ERROR(Expr::create_expr_trees(state->obj_pool(), _t_output_expr, &_output_expr_ctxs));
+    RETURN_IF_ERROR(Expr::create_expr_trees(state->obj_pool(), _t_output_expr, &_output_expr_ctxs, state));
     // Prepare the exprs to run.
-    RETURN_IF_ERROR(Expr::prepare(_output_expr_ctxs, state, _row_desc, _expr_mem_tracker.get()));
+    RETURN_IF_ERROR(Expr::prepare(_output_expr_ctxs, state));
     return Status::OK();
 }
 
@@ -85,7 +101,10 @@ Status ResultSink::prepare(RuntimeState* state) {
         _writer.reset(new (std::nothrow) FileResultWriter(_file_opts.get(), _output_expr_ctxs, _profile));
         break;
     case TResultSinkType::STATISTIC:
-        _writer.reset(new (std::nothrow) vectorized::StatisticResultWriter(_sender.get(), _output_expr_ctxs, _profile));
+        _writer.reset(new (std::nothrow) StatisticResultWriter(_sender.get(), _output_expr_ctxs, _profile));
+        break;
+    case TResultSinkType::VARIABLE:
+        _writer.reset(new (std::nothrow) VariableResultWriter(_sender.get(), _output_expr_ctxs, _profile));
         break;
     default:
         return Status::InternalError("Unknown result sink type");
@@ -96,14 +115,17 @@ Status ResultSink::prepare(RuntimeState* state) {
 }
 
 Status ResultSink::open(RuntimeState* state) {
+    RETURN_IF_ERROR(_writer->open(state));
     return Expr::open(_output_expr_ctxs, state);
 }
 
-Status ResultSink::send(RuntimeState* state, RowBatch* batch) {
-    return _writer->append_row_batch(batch);
-}
-
-Status ResultSink::send_chunk(RuntimeState* state, vectorized::Chunk* chunk) {
+Status ResultSink::send_chunk(RuntimeState* state, Chunk* chunk) {
+    // The ResultWriter memory that sends the results is no longer recorded to the query memory.
+    // There are two reason:
+    // 1. the query result has come out, and then the memory limit is triggered, cancel, it is not necessary
+    // 2. if this memory is counted, The memory of the receiving thread needs to be recorded,
+    // and the life cycle of MemTracker needs to be considered
+    SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(nullptr);
     return _writer->append_chunk(chunk);
 }
 
@@ -129,7 +151,7 @@ Status ResultSink::close(RuntimeState* state, Status exec_status) {
         }
         _sender->close(final_status);
     }
-    state->exec_env()->result_mgr()->cancel_at_time(time(NULL) + config::result_buffer_cancelled_interval_time,
+    state->exec_env()->result_mgr()->cancel_at_time(time(nullptr) + config::result_buffer_cancelled_interval_time,
                                                     state->fragment_instance_id());
     Expr::close(_output_expr_ctxs, state);
 

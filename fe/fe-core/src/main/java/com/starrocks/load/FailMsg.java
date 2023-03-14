@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/FailMsg.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -21,6 +17,8 @@
 
 package com.starrocks.load;
 
+import com.google.common.base.Objects;
+import com.google.common.base.Strings;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 
@@ -79,7 +77,11 @@ public class FailMsg implements Writable {
 
     public void write(DataOutput out) throws IOException {
         Text.writeString(out, cancelType.name());
-        Text.writeString(out, msg);
+        if (Strings.isNullOrEmpty(msg)) {
+            Text.writeString(out, "");
+        } else {
+            Text.writeString(out, msg);
+        }
     }
 
     public void readFields(DataInput in) throws IOException {
@@ -87,6 +89,12 @@ public class FailMsg implements Writable {
         msg = Text.readString(in);
     }
 
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(cancelType, msg);
+    }
+
+    @Override
     public boolean equals(Object obj) {
         if (obj == this) {
             return true;

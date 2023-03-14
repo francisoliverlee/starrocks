@@ -1,20 +1,33 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.statistics;
 
-import avro.shaded.com.google.common.collect.ImmutableList;
-import com.starrocks.analysis.CreateDbStmt;
-import com.starrocks.catalog.Catalog;
+
+import com.google.common.collect.ImmutableList;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.CreateDbStmt;
 import com.starrocks.sql.optimizer.Utils;
-import com.starrocks.statistic.Constants;
 import com.starrocks.statistic.StatisticExecutor;
-import com.starrocks.system.SystemInfoService;
+import com.starrocks.statistic.StatsConstants;
 import com.starrocks.thrift.TStatisticData;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
@@ -26,16 +39,12 @@ import org.junit.Test;
 
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.UUID;
 
 public class CachedStatisticStorageTest {
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    public static String runningDir = "fe/mocked/StatisticsTest/" + UUID.randomUUID().toString() + "/";
     public static ConnectContext connectContext;
     public static StarRocksAssert starRocksAssert;
 
-    private static final String DEFAULT_CREATE_TABLE_TEMPLATE = ""
+    public static final String DEFAULT_CREATE_TABLE_TEMPLATE = ""
             + "CREATE TABLE IF NOT EXISTS `table_statistic_v1` (\n"
             + "  `table_id` bigint NOT NULL,\n"
             + "  `column_name` varchar(65530) NOT NULL,\n"
@@ -60,30 +69,27 @@ public class CachedStatisticStorageTest {
             + ");";
 
     public static void createStatisticsTable() throws Exception {
-        CreateDbStmt dbStmt = new CreateDbStmt(false, Constants.StatisticsDBName);
-        dbStmt.setClusterName(SystemInfoService.DEFAULT_CLUSTER);
+        CreateDbStmt dbStmt = new CreateDbStmt(false, StatsConstants.STATISTICS_DB_NAME);
         try {
-            Catalog.getCurrentCatalog().createDb(dbStmt);
+            GlobalStateMgr.getCurrentState().getMetadata().createDb(dbStmt.getFullDbName());
         } catch (DdlException e) {
             return;
         }
-        starRocksAssert.useDatabase(Constants.StatisticsDBName);
+        starRocksAssert.useDatabase(StatsConstants.STATISTICS_DB_NAME);
         starRocksAssert.withTable(DEFAULT_CREATE_TABLE_TEMPLATE);
     }
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        UtFrameUtils.createMinStarRocksCluster(runningDir);
+        UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
         starRocksAssert = new StarRocksAssert(connectContext);
 
         createStatisticsTable();
-        String DB_NAME = "test";
-        starRocksAssert.withDatabase(DB_NAME).useDatabase(DB_NAME);
-
-        connectContext.getSessionVariable().setEnableMockTpch(false);
+        String dbName = "test";
+        starRocksAssert.withDatabase(dbName).useDatabase(dbName);
 
         starRocksAssert.withTable("CREATE TABLE `t0` (\n" +
                 "  `v1` bigint NULL COMMENT \"\",\n" +
@@ -105,22 +111,22 @@ public class CachedStatisticStorageTest {
 
     @Test
     public void testGetColumnStatistic(@Mocked CachedStatisticStorage cachedStatisticStorage) {
-        Database db = connectContext.getCatalog().getDb("default_cluster:test");
+        Database db = connectContext.getGlobalStateMgr().getDb("test");
         OlapTable table = (OlapTable) db.getTable("t0");
 
         new Expectations() {{
-            cachedStatisticStorage.getColumnStatistic(table, "v1");
-            result = ColumnStatistic.builder().setDistinctValuesCount(888).build();
-            minTimes = 0;
+                cachedStatisticStorage.getColumnStatistic(table, "v1");
+                result = ColumnStatistic.builder().setDistinctValuesCount(888).build();
+                minTimes = 0;
 
-            cachedStatisticStorage.getColumnStatistic(table, "v2");
-            result = ColumnStatistic.builder().setDistinctValuesCount(999).build();
-            minTimes = 0;
+                cachedStatisticStorage.getColumnStatistic(table, "v2");
+                result = ColumnStatistic.builder().setDistinctValuesCount(999).build();
+                minTimes = 0;
 
-            cachedStatisticStorage.getColumnStatistic(table, "v3");
-            result = ColumnStatistic.builder().setDistinctValuesCount(666).build();
-            minTimes = 0;
-        }};
+                cachedStatisticStorage.getColumnStatistic(table, "v3");
+                result = ColumnStatistic.builder().setDistinctValuesCount(666).build();
+                minTimes = 0;
+            }};
         ColumnStatistic columnStatistic1 =
                 Deencapsulation.invoke(cachedStatisticStorage, "getColumnStatistic", table, "v1");
         Assert.assertEquals(888, columnStatistic1.getDistinctValuesCount(), 0.001);
@@ -136,17 +142,17 @@ public class CachedStatisticStorageTest {
 
     @Test
     public void testGetColumnStatistics(@Mocked CachedStatisticStorage cachedStatisticStorage) {
-        Database db = connectContext.getCatalog().getDb("default_cluster:test");
+        Database db = connectContext.getGlobalStateMgr().getDb("test");
         OlapTable table = (OlapTable) db.getTable("t0");
 
         ColumnStatistic columnStatistic1 = ColumnStatistic.builder().setDistinctValuesCount(888).build();
         ColumnStatistic columnStatistic2 = ColumnStatistic.builder().setDistinctValuesCount(999).build();
 
         new Expectations() {{
-            cachedStatisticStorage.getColumnStatistics(table, ImmutableList.of("v1", "v2"));
-            result = ImmutableList.of(columnStatistic1, columnStatistic2);
-            minTimes = 0;
-        }};
+                cachedStatisticStorage.getColumnStatistics(table, ImmutableList.of("v1", "v2"));
+                result = ImmutableList.of(columnStatistic1, columnStatistic2);
+                minTimes = 0;
+            }};
         List<ColumnStatistic> columnStatistics = Deencapsulation
                 .invoke(cachedStatisticStorage, "getColumnStatistics", table, ImmutableList.of("v1", "v2"));
         Assert.assertEquals(2, columnStatistics.size());
@@ -156,14 +162,14 @@ public class CachedStatisticStorageTest {
 
     @Test
     public void testLoadCacheLoadEmpty(@Mocked CachedStatisticStorage cachedStatisticStorage) {
-        Database db = connectContext.getCatalog().getDb("default_cluster:test");
+        Database db = connectContext.getGlobalStateMgr().getDb("test");
         Table table = db.getTable("t0");
 
         new Expectations() {{
-            cachedStatisticStorage.getColumnStatistic(table, "v1");
-            result = ColumnStatistic.unknown();
-            minTimes = 0;
-        }};
+                cachedStatisticStorage.getColumnStatistic(table, "v1");
+                result = ColumnStatistic.unknown();
+                minTimes = 0;
+            }};
         ColumnStatistic columnStatistic =
                 Deencapsulation.invoke(cachedStatisticStorage, "getColumnStatistic", table, "v1");
         Assert.assertEquals(Double.POSITIVE_INFINITY, columnStatistic.getMaxValue(), 0.001);
@@ -175,9 +181,9 @@ public class CachedStatisticStorageTest {
 
     @Test
     public void testConvert2ColumnStatistics() {
-        Database db = connectContext.getCatalog().getDb("default_cluster:test");
+        Database db = connectContext.getGlobalStateMgr().getDb("test");
         OlapTable table = (OlapTable) db.getTable("t0");
-        CachedStatisticStorage cachedStatisticStorage = Deencapsulation.newInstance(CachedStatisticStorage.class);
+        ColumnBasicStatsCacheLoader cachedStatisticStorage = Deencapsulation.newInstance(ColumnBasicStatsCacheLoader.class);
 
         TStatisticData statisticData = new TStatisticData();
         statisticData.setDbId(db.getId());

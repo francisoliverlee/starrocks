@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/cluster/Cluster.java
 
@@ -28,22 +41,21 @@ import com.starrocks.catalog.InfoSchemaDb;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.LinkDbInfo;
+import com.starrocks.system.SystemInfoService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
-/**
- * cluster only save db and user's id and name
- */
+// Now Cluster don't have read interface, in order to be back compatible.
+// We will remove the persistent format later.
 public class Cluster implements Writable {
     private static final Logger LOG = LogManager.getLogger(Cluster.class);
 
@@ -51,6 +63,8 @@ public class Cluster implements Writable {
     private String name;
     // backend which cluster own
     private Set<Long> backendIdSet = ConcurrentHashMap.newKeySet();
+    // compute node which cluster own
+    private Set<Long> computeNodeIdSet = ConcurrentHashMap.newKeySet();
 
     private ConcurrentHashMap<String, LinkDbInfo> linkDbNames = new ConcurrentHashMap<>();
     private ConcurrentHashMap<Long, LinkDbInfo> linkDbIds = new ConcurrentHashMap<>();
@@ -83,43 +97,6 @@ public class Cluster implements Writable {
         return id;
     }
 
-    public String getName() {
-        return name;
-    }
-
-    public void addLinkDb(BaseParam param) {
-        lock();
-        try {
-            if (Strings.isNullOrEmpty(param.getStringParam(1)) || param.getLongParam(1) <= 0) {
-                return;
-            }
-            final LinkDbInfo info = new LinkDbInfo(param.getStringParam(1), param.getLongParam(1));
-            linkDbNames.put(param.getStringParam(), info);
-            linkDbIds.put(param.getLongParam(), info);
-        } finally {
-            unlock();
-        }
-    }
-
-    public void removeLinkDb(BaseParam param) {
-        lock();
-        try {
-            linkDbNames.remove(param.getStringParam());
-            linkDbIds.remove(param.getLongParam());
-        } finally {
-            unlock();
-        }
-
-    }
-
-    public boolean containLink(String dest, String src) {
-        final LinkDbInfo info = linkDbNames.get(dest);
-        if (info != null && info.getName().equals(src)) {
-            return true;
-        }
-        return false;
-    }
-
     public void addDb(String name, long id) {
         if (Strings.isNullOrEmpty(name)) {
             return;
@@ -134,18 +111,6 @@ public class Cluster implements Writable {
         }
     }
 
-    public List<String> getDbNames() {
-        final ArrayList<String> ret = new ArrayList<String>();
-        lock();
-        try {
-            ret.addAll(dbNames);
-            ret.addAll(linkDbNames.keySet());
-        } finally {
-            unlock();
-        }
-        return ret;
-    }
-
     public void removeDb(String name, long id) {
         lock();
         try {
@@ -156,12 +121,16 @@ public class Cluster implements Writable {
         }
     }
 
-    public boolean containDb(String name) {
-        return dbNames.contains(name);
+    // Just for check
+    public boolean isEmpty() {
+        return backendIdSet == null || backendIdSet.isEmpty();
+    }
+    public boolean isDefaultCluster() {
+        return SystemInfoService.DEFAULT_CLUSTER.equalsIgnoreCase(name);
     }
 
-    public List<Long> getBackendIdList() {
-        return Lists.newArrayList(backendIdSet);
+    public List<Long> getComputeNodeIdList() {
+        return Lists.newArrayList(computeNodeIdSet);
     }
 
     public void setBackendIdList(List<Long> backendIdList) {
@@ -172,12 +141,16 @@ public class Cluster implements Writable {
         backendIdSet.addAll(backendIdList);
     }
 
+    public void addComputeNode(long computeNodeId) {
+        computeNodeIdSet.add(computeNodeId);
+    }
+
     public void addBackend(long backendId) {
         backendIdSet.add(backendId);
     }
 
-    public void addBackends(List<Long> backendIds) {
-        backendIdSet.addAll(backendIds);
+    public void removeComputeNode(long removedComputeNodeId) {
+        computeNodeIdSet.remove((Long) removedComputeNodeId);
     }
 
     public void removeBackend(long removedBackendId) {
@@ -201,15 +174,15 @@ public class Cluster implements Writable {
         }
 
         int dbCount = dbIds.size();
-        if (dbNames.contains(ClusterNamespace.getFullName(this.name, InfoSchemaDb.DATABASE_NAME))) {
+        if (dbNames.contains(InfoSchemaDb.DATABASE_NAME)) {
             dbCount--;
         }
 
         out.writeInt(dbCount);
         // don't persist InfoSchemaDb meta
         for (String name : dbNames) {
-            if (!name.equals(ClusterNamespace.getFullName(this.name, InfoSchemaDb.DATABASE_NAME))) {
-                Text.writeString(out, name);
+            if (!name.equals(InfoSchemaDb.DATABASE_NAME)) {
+                Text.writeString(out, ClusterNamespace.getFullName(name));
             } else {
                 dbIds.remove(dbNameToIDs.get(name));
             }
@@ -248,7 +221,7 @@ public class Cluster implements Writable {
         }
         int count = in.readInt();
         while (count-- > 0) {
-            dbNames.add(Text.readString(in));
+            dbNames.add(ClusterNamespace.getNameFromFullName(Text.readString(in)));
         }
 
         count = in.readInt();

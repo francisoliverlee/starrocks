@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/meta/ColocateMetaService.java
 
@@ -25,10 +38,11 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.ColocateGroupSchema;
 import com.starrocks.catalog.ColocateTableIndex;
 import com.starrocks.catalog.ColocateTableIndex.GroupId;
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.DdlException;
 import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
@@ -40,6 +54,8 @@ import com.starrocks.http.rest.RestResult;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.ColocatePersistInfo;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.UserIdentity;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import org.apache.logging.log4j.LogManager;
@@ -60,8 +76,8 @@ import java.util.List;
  *          {"colocate_meta":{"groupName2Id":{...},"group2Tables":{}, ...},"status":"OK"}
  *
  *      eg:
- *          POST    /api/colocate/group_stable?db_id=123&group_id=456  (mark group[123.456] as unstable)
- *          DELETE  /api/colocate/group_stable?db_id=123&group_id=456  (mark group[123.456] as stable)
+ *          POST    /api/colocate/group_stable?db_id=123&group_id=456   (mark group[123.456] as stable)
+ *          POST    /api/colocate/group_unstable?db_id=123&group_id=456 (mark group[123.456] as unstable)
  *
  * BucketSeqAction:
  *  change the backends per bucket sequence of a group
@@ -69,12 +85,10 @@ import java.util.List;
  *          POST    /api/colocate/bucketseq?db_id=123&group_id=456
  */
 public class ColocateMetaService {
-    private static final Logger LOG = LogManager.getLogger(ColocateMetaService.class);
     private static final String GROUP_ID = "group_id";
-    private static final String TABLE_ID = "table_id";
     private static final String DB_ID = "db_id";
 
-    private static ColocateTableIndex colocateIndex = Catalog.getCurrentColocateIndex();
+    private static ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentColocateIndex();
 
     private static GroupId checkAndGetGroupId(BaseRequest request) throws DdlException {
         long grpId = Long.valueOf(request.getSingleParameter(GROUP_ID).trim());
@@ -95,15 +109,20 @@ public class ColocateMetaService {
         @Override
         public void executeWithoutPassword(BaseRequest request, BaseResponse response)
                 throws DdlException {
-            if (redirectToMaster(request, response)) {
+            if (redirectToLeader(request, response)) {
                 return;
             }
-            checkGlobalAuth(ConnectContext.get().getCurrentUserIdentity(), PrivPredicate.ADMIN);
-            executeInMasterWithAdmin(request, response);
+            UserIdentity currentUser = ConnectContext.get().getCurrentUserIdentity();
+            if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
+                checkUserOwnsAdminRole(currentUser);
+            } else {
+                checkGlobalAuth(currentUser, PrivPredicate.ADMIN);
+            }
+            executeInLeaderWithAdmin(request, response);
         }
 
         // implement in derived classes
-        protected void executeInMasterWithAdmin(BaseRequest request, BaseResponse response)
+        protected void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
                 throws DdlException {
             throw new DdlException("Not implemented");
         }
@@ -121,16 +140,16 @@ public class ColocateMetaService {
         }
 
         @Override
-        public void executeInMasterWithAdmin(BaseRequest request, BaseResponse response)
+        public void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
                 throws DdlException {
             response.setContentType("application/json");
             RestResult result = new RestResult();
-            result.addResultEntry("colocate_meta", Catalog.getCurrentColocateIndex());
+            result.addResultEntry("colocate_meta", GlobalStateMgr.getCurrentColocateIndex());
             sendResult(request, response, result);
         }
     }
 
-    // mark a colocate group as stable or unstable
+    // mark a colocate group as stable
     public static class MarkGroupStableAction extends ColocateMetaBaseAction {
         MarkGroupStableAction(ActionController controller) {
             super(controller);
@@ -139,18 +158,15 @@ public class ColocateMetaService {
         public static void registerAction(ActionController controller) throws IllegalArgException {
             MarkGroupStableAction action = new MarkGroupStableAction(controller);
             controller.registerHandler(HttpMethod.POST, "/api/colocate/group_stable", action);
-            controller.registerHandler(HttpMethod.DELETE, "/api/colocate/group_stable", action);
         }
 
         @Override
-        public void executeInMasterWithAdmin(BaseRequest request, BaseResponse response)
+        public void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
                 throws DdlException {
             GroupId groupId = checkAndGetGroupId(request);
 
             HttpMethod method = request.getRequest().method();
             if (method.equals(HttpMethod.POST)) {
-                colocateIndex.markGroupUnstable(groupId, true);
-            } else if (method.equals(HttpMethod.DELETE)) {
                 colocateIndex.markGroupStable(groupId, true);
             } else {
                 response.appendContent(new RestBaseResult("HTTP method is not allowed.").toJson());
@@ -158,6 +174,121 @@ public class ColocateMetaService {
             }
 
             sendResult(request, response);
+        }
+    }
+
+    // mark a colocate group as unstable
+    public static class MarkGroupUnstableAction extends ColocateMetaBaseAction {
+        MarkGroupUnstableAction(ActionController controller) {
+            super(controller);
+        }
+
+        public static void registerAction(ActionController controller) throws IllegalArgException {
+            MarkGroupUnstableAction action = new MarkGroupUnstableAction(controller);
+            controller.registerHandler(HttpMethod.POST, "/api/colocate/group_unstable", action);
+        }
+
+        @Override
+        public void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
+                throws DdlException {
+            GroupId groupId = checkAndGetGroupId(request);
+
+            HttpMethod method = request.getRequest().method();
+            if (method.equals(HttpMethod.POST)) {
+                colocateIndex.markGroupUnstable(groupId, true);
+            } else {
+                response.appendContent(new RestBaseResult("HTTP method is not allowed.").toJson());
+                writeResponse(request, response, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            }
+
+            sendResult(request, response);
+        }
+    }
+
+    // only applies to lake table
+    public static class UpdateGroupAction extends ColocateMetaBaseAction {
+        private static final String TABLE_ID = "table_id";
+        private static final String IS_JOIN = "is_join";
+
+        UpdateGroupAction(ActionController controller) {
+            super(controller);
+        }
+
+        public static void registerAction(ActionController controller) throws IllegalArgException {
+            UpdateGroupAction action = new UpdateGroupAction(controller);
+            controller.registerHandler(HttpMethod.POST, "/api/colocate/update_group", action);
+        }
+
+        @Override
+        public void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
+                throws DdlException {
+            HttpMethod method = request.getRequest().method();
+            if (!method.equals(HttpMethod.POST)) {
+                response.appendContent(new RestBaseResult("HTTP method is not allowed.").toJson());
+                writeResponse(request, response, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            }
+            long dbId = Long.valueOf(request.getSingleParameter(DB_ID).trim());
+            if (dbId <= 0) {
+                response.appendContent("Bad db_id parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            long grpId = Long.valueOf(request.getSingleParameter(GROUP_ID).trim());
+            if (grpId <= 0) {
+                response.appendContent("Bad group_id parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            GroupId groupId = new GroupId(dbId, grpId);
+            long tableId = Long.valueOf(request.getSingleParameter(TABLE_ID).trim());
+            if (tableId <= 0) {
+                response.appendContent("Bad table_id parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            String isJoinStr = request.getSingleParameter(IS_JOIN);
+            boolean isJoin = true;
+            if (Strings.isNullOrEmpty(isJoinStr)) {
+                response.appendContent("Missing is_join parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            if (!isJoinStr.equalsIgnoreCase("true") && !isJoinStr.equalsIgnoreCase("false")) {
+                response.appendContent("Invalid is_join parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            if (isJoinStr.equalsIgnoreCase("true")) {
+                isJoin = true;
+            } else {
+                isJoin = false;
+            }
+
+            Database db = GlobalStateMgr.getCurrentState().getDbIncludeRecycleBin(groupId.dbId);
+            if (db == null) {
+                response.appendContent("Non-exist db");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            db.writeLock();
+            try {
+                OlapTable table = (OlapTable) globalStateMgr.getCurrentState().getTableIncludeRecycleBin(db, tableId);
+                if (table == null) {
+                    response.appendContent("Non-exist table");
+                    writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                    return;
+                }
+                if (!table.isLakeTable()) {
+                    response.appendContent("Not-supported table type");
+                    writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                    return;
+                }
+                colocateIndex.updateLakeTableColocationInfo(table, isJoin, groupId);
+                response.appendContent("update succeed");
+                sendResult(request, response);
+            } finally {
+                db.writeUnlock();
+            }
         }
     }
 
@@ -175,12 +306,8 @@ public class ColocateMetaService {
         }
 
         @Override
-        public void executeInMasterWithAdmin(BaseRequest request, BaseResponse response)
+        public void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
                 throws DdlException {
-            final String clusterName = ConnectContext.get().getClusterName();
-            if (Strings.isNullOrEmpty(clusterName)) {
-                throw new DdlException("No cluster selected.");
-            }
             GroupId groupId = checkAndGetGroupId(request);
 
             String meta = request.getContent();
@@ -189,13 +316,14 @@ public class ColocateMetaService {
             List<List<Long>> backendsPerBucketSeq = new Gson().fromJson(meta, type);
             LOG.info("get buckets sequence: {}", backendsPerBucketSeq);
 
-            ColocateGroupSchema groupSchema = Catalog.getCurrentColocateIndex().getGroupSchema(groupId);
+            ColocateGroupSchema groupSchema = GlobalStateMgr.getCurrentColocateIndex().getGroupSchema(groupId);
             if (backendsPerBucketSeq.size() != groupSchema.getBucketsNum()) {
                 throw new DdlException("Invalid bucket num. expected: " + groupSchema.getBucketsNum() + ", actual: "
                         + backendsPerBucketSeq.size());
             }
 
-            List<Long> clusterBackendIds = Catalog.getCurrentSystemInfo().getClusterBackendIds(clusterName, true);
+            List<Long> clusterBackendIds =
+                    GlobalStateMgr.getCurrentSystemInfo().getBackendIds(true);
             //check the Backend id
             for (List<Long> backendIds : backendsPerBucketSeq) {
                 if (backendIds.size() != groupSchema.getReplicationNum()) {
@@ -222,7 +350,7 @@ public class ColocateMetaService {
             colocateIndex.addBackendsPerBucketSeq(groupId, backendsPerBucketSeq);
             ColocatePersistInfo info2 =
                     ColocatePersistInfo.createForBackendsPerBucketSeq(groupId, backendsPerBucketSeq);
-            Catalog.getCurrentCatalog().getEditLog().logColocateBackendsPerBucketSeq(info2);
+            GlobalStateMgr.getCurrentState().getEditLog().logColocateBackendsPerBucketSeq(info2);
         }
     }
 

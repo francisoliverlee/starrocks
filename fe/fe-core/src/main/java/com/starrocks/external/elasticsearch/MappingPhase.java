@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/external/elasticsearch/MappingPhase.java
 
@@ -39,22 +52,13 @@ public class MappingPhase implements SearchPhase {
     // json response for `{index}/_mapping` API
     private String jsonMapping;
 
-    private boolean includeTypeName = false;
-
     public MappingPhase(EsRestClient client) {
         this.client = client;
     }
 
     @Override
-    public void preProcess(SearchContext context) {
-        if (context.version() != null && context.version().onOrAfter(EsMajorVersion.V_7_X)) {
-            includeTypeName = true;
-        }
-    }
-
-    @Override
     public void execute(SearchContext context) throws StarRocksESException {
-        jsonMapping = client.getMapping(context.sourceIndex(), includeTypeName);
+        jsonMapping = client.getMapping(context.sourceIndex());
     }
 
     @Override
@@ -79,15 +83,15 @@ public class MappingPhase implements SearchPhase {
         JSONObject mappings = docData.optJSONObject("mappings");
         JSONObject rootSchema = mappings.optJSONObject(searchContext.type());
         JSONObject properties;
-        // After (include) 7.x, type was removed from ES mapping, default type is `_doc`
+        // Elasticsearch 7.x, type was removed from ES mapping, default type is `_doc`
         // https://www.elastic.co/guide/en/elasticsearch/reference/7.0/removal-of-types.html
+        // From Elasticsearch 8.x, Specifying types in requests is no longer supported,
+        // The include_type_name parameter is removed
+        // https://www.elastic.co/guide/en/elasticsearch/reference/7.17/removal-of-types.html
         if (rootSchema == null) {
-            if (searchContext.type().equals("_doc") == false) {
-                throw new StarRocksESException("index[" + searchContext.sourceIndex() + "]'s type must be exists, "
-                        + " and after ES7.x type must be `_doc`, but found ["
-                        + searchContext.type() + "], for table ["
-                        + searchContext.esTable().getName() + "]");
-            }
+            // 1. before 7.0, if the `type` does not exist in index, rootSchema is null
+            //   this can throw exception within the `properties == null` predicate
+            // 2. after or equal 8.x, type is removed from mappings
             properties = mappings.optJSONObject("properties");
         } else {
             properties = rootSchema.optJSONObject("properties");
@@ -130,6 +134,10 @@ public class MappingPhase implements SearchPhase {
 
     private void resolveDocValuesFields(SearchContext searchContext, JSONObject fieldObject, String colName) {
         String fieldType = fieldObject.optString("type");
+        // skip `nested` or object type
+        if ("nested".equals(fieldType) || fieldObject.has("properties")) {
+            return;
+        }
         String docValueField = null;
         if (EsTable.DEFAULT_DOCVALUE_DISABLED_FIELDS.contains(fieldType)) {
             JSONObject fieldsObject = fieldObject.optJSONObject("fields");

@@ -1,217 +1,338 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/exec/file_scanner.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-#include "file_scanner.h"
+#include "exec/file_scanner.h"
 
-#include "common/logging.h"
+#include <memory>
+
+#include "column/chunk.h"
+#include "column/column_helper.h"
+#include "column/hash_set.h"
+#include "column/vectorized_fwd.h"
+#include "fs/fs.h"
+#include "fs/fs_broker.h"
+#include "fs/fs_hdfs.h"
+#include "gutil/strings/substitute.h"
+#include "io/compressed_input_stream.h"
 #include "runtime/descriptors.h"
-#include "runtime/mem_tracker.h"
-#include "runtime/raw_value.h"
+#include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
-#include "runtime/tuple.h"
+#include "runtime/stream_load/load_stream_mgr.h"
+#include "util/compression/stream_compression.h"
 
 namespace starrocks {
 
-FileScanner::FileScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRangeParams& params,
-                         ScannerCounter* counter)
+FileScanner::FileScanner(starrocks::RuntimeState* state, starrocks::RuntimeProfile* profile,
+                         const starrocks::TBrokerScanRangeParams& params, starrocks::ScannerCounter* counter)
         : _state(state),
+          _profile(profile),
           _params(params),
           _counter(counter),
-          _src_tuple(nullptr),
-          _src_tuple_row(nullptr),
-#if BE_TEST
-          _mem_tracker(new MemTracker()),
-          _mem_pool(_mem_tracker.get()),
-#else
-          _mem_tracker(new MemTracker(-1, "Broker FileScanner", state->instance_mem_tracker())),
-          _mem_pool(_state->instance_mem_tracker()),
-#endif
-          _dest_tuple_desc(nullptr),
+          _row_desc(nullptr),
           _strict_mode(false),
-          _profile(profile),
-          _rows_read_counter(nullptr),
-          _read_timer(nullptr),
-          _materialize_timer(nullptr) {
+          _error_counter(0) {}
+
+FileScanner::~FileScanner() = default;
+
+void FileScanner::close() {
+    Expr::close(_dest_expr_ctx, _state);
 }
 
-Status FileScanner::open() {
-    RETURN_IF_ERROR(init_expr_ctxes());
-    if (_params.__isset.strict_mode) {
-        _strict_mode = _params.strict_mode;
-    }
-    if (_strict_mode && !_params.__isset.dest_sid_to_src_sid_without_trans) {
-        return Status::InternalError("Slot map of dest to src must be set in strict mode");
-    }
-    _rows_read_counter = ADD_COUNTER(_profile, "RowsRead", TUnit::UNIT);
-    _read_timer = ADD_TIMER(_profile, "TotalRawReadTime(*)");
-    _materialize_timer = ADD_TIMER(_profile, "MaterializeTupleTime(*)");
-    return Status::OK();
-}
-
-Status FileScanner::init_expr_ctxes() {
-    // Constcut _src_slot_descs
+Status FileScanner::init_expr_ctx() {
     const TupleDescriptor* src_tuple_desc = _state->desc_tbl().get_tuple_descriptor(_params.src_tuple_id);
+
     if (src_tuple_desc == nullptr) {
-        std::stringstream ss;
-        ss << "Unknown source tuple descriptor, tuple_id=" << _params.src_tuple_id;
-        return Status::InternalError(ss.str());
+        return Status::InternalError(
+                strings::Substitute("Unknown source tuple descriptor, tuple_id=$0", _params.src_tuple_id));
     }
 
-    std::map<SlotId, SlotDescriptor*> src_slot_desc_map;
-    for (auto slot_desc : src_tuple_desc->slots()) {
+    // sources
+    std::unordered_map<SlotId, SlotDescriptor*> src_slot_desc_map;
+    for (const auto& slot_desc : src_tuple_desc->slots()) {
         src_slot_desc_map.emplace(slot_desc->id(), slot_desc);
     }
+
     for (auto slot_id : _params.src_slot_ids) {
         auto it = src_slot_desc_map.find(slot_id);
         if (it == std::end(src_slot_desc_map)) {
-            std::stringstream ss;
-            ss << "Unknown source slot descriptor, slot_id=" << slot_id;
-            return Status::InternalError(ss.str());
+            _src_slot_descriptors.emplace_back(nullptr);
+            continue;
         }
-        _src_slot_descs.emplace_back(it->second);
-    }
-    // Construct source tuple and tuple row
-    _src_tuple = (Tuple*)_mem_pool.allocate(src_tuple_desc->byte_size());
-    if (UNLIKELY(_src_tuple == nullptr)) {
-        return Status::InternalError("Mem usage has exceed the limit of BE");
-    }
-    _src_tuple_row = (TupleRow*)_mem_pool.allocate(sizeof(Tuple*));
-    if (UNLIKELY(_src_tuple_row == nullptr)) {
-        return Status::InternalError("Mem usage has exceed the limit of BE");
-    }
-    _src_tuple_row->set_tuple(0, _src_tuple);
-    _row_desc.reset(new RowDescriptor(_state->desc_tbl(), std::vector<TupleId>({_params.src_tuple_id}),
-                                      std::vector<bool>({false})));
 
-    // Construct dest slots information
+        _src_slot_descriptors.emplace_back(it->second);
+    }
+
+    _row_desc = std::make_unique<RowDescriptor>(_state->desc_tbl(), std::vector<TupleId>{_params.src_tuple_id},
+                                                std::vector<bool>{false});
+
+    // destination
     _dest_tuple_desc = _state->desc_tbl().get_tuple_descriptor(_params.dest_tuple_id);
     if (_dest_tuple_desc == nullptr) {
-        std::stringstream ss;
-        ss << "Unknown dest tuple descriptor, tuple_id=" << _params.dest_tuple_id;
-        return Status::InternalError(ss.str());
+        return Status::InternalError(
+                strings::Substitute("Unknown dest tuple descriptor, tuple_id=$0", _params.dest_tuple_id));
     }
 
     bool has_slot_id_map = _params.__isset.dest_sid_to_src_sid_without_trans;
-    for (auto slot_desc : _dest_tuple_desc->slots()) {
+
+    for (const SlotDescriptor* slot_desc : _dest_tuple_desc->slots()) {
         if (!slot_desc->is_materialized()) {
             continue;
         }
+
         auto it = _params.expr_of_dest_slot.find(slot_desc->id());
         if (it == std::end(_params.expr_of_dest_slot)) {
-            std::stringstream ss;
-            ss << "No expr for dest slot, id=" << slot_desc->id() << ", name=" << slot_desc->col_name();
-            return Status::InternalError(ss.str());
+            return Status::InternalError(strings::Substitute("No expr for dest slot, id=$0, name=$1", slot_desc->id(),
+                                                             slot_desc->col_name()));
         }
+
         ExprContext* ctx = nullptr;
-        RETURN_IF_ERROR(Expr::create_expr_tree(_state->obj_pool(), it->second, &ctx));
-        RETURN_IF_ERROR(ctx->prepare(_state, *_row_desc.get(), _mem_tracker.get()));
+        RETURN_IF_ERROR(Expr::create_expr_tree(_state->obj_pool(), it->second, &ctx, _state));
+        RETURN_IF_ERROR(ctx->prepare(_state));
         RETURN_IF_ERROR(ctx->open(_state));
+
         _dest_expr_ctx.emplace_back(ctx);
+
         if (has_slot_id_map) {
             auto it = _params.dest_sid_to_src_sid_without_trans.find(slot_desc->id());
+
             if (it == std::end(_params.dest_sid_to_src_sid_without_trans)) {
-                _src_slot_descs_order_by_dest.emplace_back(nullptr);
+                _dest_slot_desc_mappings.emplace_back(nullptr);
             } else {
                 auto _src_slot_it = src_slot_desc_map.find(it->second);
                 if (_src_slot_it == std::end(src_slot_desc_map)) {
-                    std::stringstream ss;
-                    ss << "No src slot " << it->second << " in src slot descs";
-                    return Status::InternalError(ss.str());
+                    return Status::InternalError(strings::Substitute("No src slot $0 in src slot desc", it->second));
                 }
-                _src_slot_descs_order_by_dest.emplace_back(_src_slot_it->second);
+                _dest_slot_desc_mappings.emplace_back(_src_slot_it->second);
             }
         }
     }
     return Status::OK();
 }
 
-bool FileScanner::fill_dest_tuple(Tuple* dest_tuple, MemPool* mem_pool) {
-    int ctx_idx = 0;
-    for (auto slot_desc : _dest_tuple_desc->slots()) {
-        if (!slot_desc->is_materialized()) {
-            continue;
-        }
+Status FileScanner::open() {
+    RETURN_IF_ERROR(init_expr_ctx());
 
-        int dest_index = ctx_idx++;
-        ExprContext* ctx = _dest_expr_ctx[dest_index];
-        void* value = ctx->get_value(_src_tuple_row);
-        if (value == nullptr) {
-            // Only when the expr return value is null, we will check the error message.
-            std::string expr_error = ctx->get_error_msg();
-            if (!expr_error.empty()) {
-                _state->append_error_msg_to_file(_src_tuple_row->to_string(*(_row_desc.get())), expr_error);
-                _counter->num_rows_filtered++;
-                // The ctx is reused, so must clear the error state and message.
-                ctx->clear_error_msg();
-                return false;
-            }
-            // If _strict_mode is false, _src_slot_descs_order_by_dest size could be zero
-            if (_strict_mode && (_src_slot_descs_order_by_dest[dest_index] != nullptr) &&
-                !_src_tuple->is_null(_src_slot_descs_order_by_dest[dest_index]->null_indicator_offset())) {
-                //Type of the slot is must be Varchar in _src_tuple.
-                StringValue* raw_value =
-                        _src_tuple->get_string_slot(_src_slot_descs_order_by_dest[dest_index]->tuple_offset());
-                std::string raw_string;
-                if (raw_value != nullptr) { //is not null then get raw value
-                    raw_string = raw_value->to_string();
-                }
-                std::stringstream error_msg;
-                error_msg << "column(" << slot_desc->col_name() << ") value is incorrect "
-                          << "while strict mode is " << std::boolalpha << _strict_mode << ", src value is "
-                          << raw_string;
-                _state->append_error_msg_to_file(_src_tuple_row->to_string(*(_row_desc.get())), error_msg.str());
-                _counter->num_rows_filtered++;
-                return false;
-            }
-            if (!slot_desc->is_nullable()) {
-                std::stringstream error_msg;
-                error_msg << "column(" << slot_desc->col_name() << ") value is null "
-                          << "while columns is not nullable";
-                _state->append_error_msg_to_file(_src_tuple_row->to_string(*(_row_desc.get())), error_msg.str());
-                _counter->num_rows_filtered++;
-                return false;
-            }
-            dest_tuple->set_null(slot_desc->null_indicator_offset());
-            continue;
-        }
-        if (slot_desc->is_nullable()) {
-            dest_tuple->set_not_null(slot_desc->null_indicator_offset());
-        }
-        void* slot = dest_tuple->get_slot(slot_desc->tuple_offset());
-        RawValue::write(value, slot, slot_desc->type(), mem_pool);
-        continue;
+    if (_params.__isset.strict_mode) {
+        _strict_mode = _params.strict_mode;
     }
-    return true;
+
+    if (_strict_mode && !_params.__isset.dest_sid_to_src_sid_without_trans) {
+        return Status::InternalError("Slot map of dest to src must be set in strict mode");
+    }
+
+    if (_params.__isset.properties) {
+        auto iter = _params.properties.find("case_sensitive");
+        if (iter != _params.properties.end()) {
+            std::istringstream(iter->second) >> std::boolalpha >> _case_sensitive;
+        }
+    }
+    return Status::OK();
 }
 
-void FileScanner::fill_slots_of_columns_from_path(int start, const std::vector<std::string>& columns_from_path) {
-    // values of columns from path can not be null
+void FileScanner::fill_columns_from_path(starrocks::ChunkPtr& chunk, int slot_start,
+                                         const std::vector<std::string>& columns_from_path, int size) {
+    auto varchar_type = TypeDescriptor::create_varchar_type(TypeDescriptor::MAX_VARCHAR_LENGTH);
+    // fill column with partition values.
     for (int i = 0; i < columns_from_path.size(); ++i) {
-        auto slot_desc = _src_slot_descs.at(i + start);
-        _src_tuple->set_not_null(slot_desc->null_indicator_offset());
-        void* slot = _src_tuple->get_slot(slot_desc->tuple_offset());
-        StringValue* str_slot = reinterpret_cast<StringValue*>(slot);
+        auto slot_desc = _src_slot_descriptors.at(i + slot_start);
+        if (slot_desc == nullptr) continue;
+        auto col = ColumnHelper::create_column(varchar_type, slot_desc->is_nullable());
         const std::string& column_from_path = columns_from_path[i];
-        str_slot->ptr = const_cast<char*>(column_from_path.c_str());
-        str_slot->len = column_from_path.size();
+        Slice s(column_from_path.c_str(), column_from_path.size());
+        col->append_value_multiple_times(&s, size);
+        chunk->append_column(std::move(col), slot_desc->id());
+    }
+}
+
+StatusOr<ChunkPtr> FileScanner::materialize(const starrocks::ChunkPtr& src, starrocks::ChunkPtr& cast) {
+    SCOPED_RAW_TIMER(&_counter->materialize_ns);
+
+    if (cast->num_rows() == 0) {
+        return cast;
+    }
+
+    // materialize
+    ChunkPtr dest_chunk = std::make_shared<Chunk>();
+
+    int ctx_index = 0;
+    int before_rows = cast->num_rows();
+    Filter filter(cast->num_rows(), 1);
+
+    // CREATE ROUTINE LOAD routine_load_job_1
+    // on table COLUMNS (k1,k2,k3=k1)
+    // The column k3 and k1 will pointer to the same entity.
+    // The k3 should be copied to avoid this case.
+    // column_pointers is a hashset to check the repeatability.
+    HashSet<uintptr_t> column_pointers;
+    for (const auto& slot : _dest_tuple_desc->slots()) {
+        if (!slot->is_materialized()) {
+            continue;
+        }
+
+        int dest_index = ctx_index++;
+        ExprContext* ctx = _dest_expr_ctx[dest_index];
+        ASSIGN_OR_RETURN(auto col, ctx->evaluate(cast.get()));
+        auto col_pointer = reinterpret_cast<uintptr_t>(col.get());
+        if (column_pointers.contains(col_pointer)) {
+            col = col->clone();
+        } else {
+            column_pointers.emplace(col_pointer);
+        }
+
+        col = ColumnHelper::unfold_const_column(slot->type(), cast->num_rows(), col);
+
+        // The column builder in ctx->evaluate may build column as non-nullable.
+        // See be/src/column/column_builder.h#L79.
+        if (!col->is_nullable() && slot->is_nullable()) {
+            col = ColumnHelper::cast_to_nullable_column(col);
+        }
+
+        dest_chunk->append_column(col, slot->id());
+
+        if (src != nullptr && col->is_nullable() && col->has_null()) {
+            if (_strict_mode && _dest_slot_desc_mappings[dest_index] != nullptr) {
+                ColumnPtr& src_col = src->get_column_by_slot_id(_dest_slot_desc_mappings[dest_index]->id());
+
+                for (int i = 0; i < col->size(); ++i) {
+                    if (!col->is_null(i) || src_col->is_null(i) || !filter[i]) {
+                        continue;
+                    }
+
+                    filter[i] = 0;
+                    _error_counter++;
+
+                    // avoid print too many debug log
+                    if (_error_counter > 50) {
+                        continue;
+                    }
+                    std::stringstream error_msg;
+                    error_msg << "Value '" << src_col->debug_item(i) << "' is out of range. "
+                              << "The type of '" << slot->col_name() << "' is " << slot->type().debug_string();
+                    _state->append_error_msg_to_file(src->debug_row(i), error_msg.str());
+                }
+            }
+        }
+    }
+
+    dest_chunk->filter(filter);
+    _counter->num_rows_filtered += (before_rows - dest_chunk->num_rows());
+
+    return dest_chunk;
+}
+
+Status FileScanner::create_sequential_file(const TBrokerRangeDesc& range_desc, const TNetworkAddress& address,
+                                           const TBrokerScanRangeParams& params,
+                                           std::shared_ptr<SequentialFile>* file) {
+    CompressionTypePB compression = CompressionTypePB::DEFAULT_COMPRESSION;
+    if (range_desc.format_type == TFileFormatType::FORMAT_JSON) {
+        compression = CompressionTypePB::NO_COMPRESSION;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_CSV_PLAIN) {
+        compression = CompressionTypePB::NO_COMPRESSION;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_CSV_GZ) {
+        compression = CompressionTypePB::GZIP;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_CSV_BZ2) {
+        compression = CompressionTypePB::BZIP2;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_CSV_LZ4_FRAME) {
+        compression = CompressionTypePB::LZ4_FRAME;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_CSV_DEFLATE) {
+        compression = CompressionTypePB::DEFLATE;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_CSV_ZSTD) {
+        compression = CompressionTypePB::ZSTD;
+    } else if (range_desc.format_type == TFileFormatType::FORMAT_AVRO) {
+        compression = CompressionTypePB::NO_COMPRESSION;
+    } else {
+        return Status::NotSupported("Unsupported compression algorithm: " + std::to_string(range_desc.format_type));
+    }
+
+    std::shared_ptr<SequentialFile> src_file;
+    switch (range_desc.file_type) {
+    case TFileType::FILE_LOCAL: {
+        ASSIGN_OR_RETURN(src_file, FileSystem::Default()->new_sequential_file(range_desc.path));
+        break;
+    }
+    case TFileType::FILE_STREAM: {
+        auto pipe = _state->exec_env()->load_stream_mgr()->get(range_desc.load_id);
+        if (pipe == nullptr) {
+            std::stringstream ss("Invalid or outdated load id ");
+            range_desc.load_id.printTo(ss);
+            return Status::InternalError(std::string(ss.str()));
+        }
+        bool non_blocking_read = false;
+        if (params.__isset.non_blocking_read) {
+            non_blocking_read = params.non_blocking_read;
+        }
+        auto stream = std::make_shared<StreamLoadPipeInputStream>(std::move(pipe), non_blocking_read);
+        src_file = std::make_shared<SequentialFile>(std::move(stream), "stream-load-pipe");
+        break;
+    }
+    case TFileType::FILE_BROKER: {
+        if (params.__isset.use_broker && !params.use_broker) {
+            ASSIGN_OR_RETURN(auto fs, FileSystem::CreateUniqueFromString(range_desc.path, FSOptions(&params)));
+            ASSIGN_OR_RETURN(auto file, fs->new_sequential_file(range_desc.path));
+            src_file = std::shared_ptr<SequentialFile>(std::move(file));
+            break;
+        } else {
+            BrokerFileSystem fs_broker(address, params.properties);
+            ASSIGN_OR_RETURN(auto broker_file, fs_broker.new_sequential_file(range_desc.path));
+            src_file = std::shared_ptr<SequentialFile>(std::move(broker_file));
+            break;
+        }
+    }
+    }
+    if (compression == CompressionTypePB::NO_COMPRESSION) {
+        *file = src_file;
+        return Status::OK();
+    }
+
+    using DecompressorPtr = std::shared_ptr<StreamCompression>;
+    std::unique_ptr<StreamCompression> dec;
+    RETURN_IF_ERROR(StreamCompression::create_decompressor(compression, &dec));
+    auto stream = std::make_unique<io::CompressedInputStream>(src_file->stream(), DecompressorPtr(dec.release()));
+    *file = std::make_shared<SequentialFile>(std::move(stream), range_desc.path);
+    return Status::OK();
+}
+
+Status FileScanner::create_random_access_file(const TBrokerRangeDesc& range_desc, const TNetworkAddress& address,
+                                              const TBrokerScanRangeParams& params, CompressionTypePB compression,
+                                              std::shared_ptr<RandomAccessFile>* file) {
+    std::shared_ptr<RandomAccessFile> src_file;
+    switch (range_desc.file_type) {
+    case TFileType::FILE_LOCAL: {
+        ASSIGN_OR_RETURN(src_file, FileSystem::Default()->new_random_access_file(range_desc.path));
+        break;
+    }
+    case TFileType::FILE_BROKER: {
+        if (params.__isset.use_broker && !params.use_broker) {
+            ASSIGN_OR_RETURN(auto fs, FileSystem::CreateUniqueFromString(range_desc.path, FSOptions(&params)));
+            ASSIGN_OR_RETURN(auto file, fs->new_random_access_file(RandomAccessFileOptions(), range_desc.path));
+            src_file = std::shared_ptr<RandomAccessFile>(std::move(file));
+            break;
+        } else {
+            BrokerFileSystem fs_broker(address, params.properties);
+            ASSIGN_OR_RETURN(auto broker_file, fs_broker.new_random_access_file(range_desc.path));
+            src_file = std::shared_ptr<RandomAccessFile>(std::move(broker_file));
+            break;
+        }
+    }
+    case TFileType::FILE_STREAM:
+        return Status::NotSupported("Does not support create random-access file from file stream");
+    }
+    if (compression == CompressionTypePB::NO_COMPRESSION) {
+        *file = src_file;
+        return Status::OK();
+    } else {
+        return Status::NotSupported("Does not support compressed random-access file");
     }
 }
 

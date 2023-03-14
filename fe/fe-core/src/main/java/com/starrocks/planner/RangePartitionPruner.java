@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/RangePartitionPruner.java
 
@@ -36,6 +49,7 @@ import com.starrocks.common.AnalysisException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -56,11 +70,11 @@ public class RangePartitionPruner implements PartitionPruner {
         partitionColumnFilters = filters;
     }
 
-    private Collection<Long> prune(RangeMap<PartitionKey, Long> rangeMap,
-                                   int columnIdx,
-                                   PartitionKey minKey,
-                                   PartitionKey maxKey,
-                                   int complex)
+    private List<Long> prune(RangeMap<PartitionKey, Long> rangeMap,
+                             int columnIdx,
+                             PartitionKey minKey,
+                             PartitionKey maxKey,
+                             int complex)
             throws AnalysisException {
         LOG.debug("column idx {}, column filters {}", columnIdx, partitionColumnFilters);
         // the last column in partition Key
@@ -79,7 +93,7 @@ public class RangePartitionPruner implements PartitionPruner {
                     keyColumn.getPrimitiveType());
             maxKey.pushColumn(LiteralExpr.createInfinity(Type.fromPrimitiveType(keyColumn.getPrimitiveType()), true),
                     keyColumn.getPrimitiveType());
-            Collection<Long> result = null;
+            List<Long> result;
             try {
                 result = Lists.newArrayList(
                         rangeMap.subRangeMap(Range.closed(minKey, maxKey)).asMapOfRanges().values());
@@ -107,7 +121,7 @@ public class RangePartitionPruner implements PartitionPruner {
                     minKey.pushColumn(filter.lowerBound, keyColumn.getPrimitiveType());
                     maxKey.pushColumn(filter.upperBound, keyColumn.getPrimitiveType());
                 }
-                Collection<Long> result = prune(rangeMap, columnIdx + 1, minKey, maxKey, complex);
+                List<Long> result = prune(rangeMap, columnIdx + 1, minKey, maxKey, complex);
                 minKey.popColumn();
                 maxKey.popColumn();
                 return result;
@@ -150,7 +164,7 @@ public class RangePartitionPruner implements PartitionPruner {
                 pushMaxCount++;
             }
 
-            Collection<Long> result = null;
+            List<Long> result;
             try {
                 result = Lists.newArrayList(rangeMap.subRangeMap(
                         Range.range(minKey, lowerType, maxKey, upperType)).asMapOfRanges().values());
@@ -172,17 +186,15 @@ public class RangePartitionPruner implements PartitionPruner {
             minKey.pushColumn(expr, keyColumn.getPrimitiveType());
             maxKey.pushColumn(expr, keyColumn.getPrimitiveType());
             Collection<Long> subList = prune(rangeMap, columnIdx + 1, minKey, maxKey, newComplex);
-            for (long partId : subList) {
-                resultSet.add(partId);
-            }
+            resultSet.addAll(subList);
             minKey.popColumn();
             maxKey.popColumn();
         }
 
-        return resultSet;
+        return new ArrayList<>(resultSet);
     }
 
-    public Collection<Long> prune() throws AnalysisException {
+    public List<Long> prune() throws AnalysisException {
         PartitionKey minKey = new PartitionKey();
         PartitionKey maxKey = new PartitionKey();
         // Map to RangeMapTree

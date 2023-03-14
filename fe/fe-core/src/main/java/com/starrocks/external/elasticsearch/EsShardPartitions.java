@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/external/elasticsearch/EsShardPartitions.java
 
@@ -23,8 +36,8 @@ package com.starrocks.external.elasticsearch;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.SingleRangePartitionDesc;
 import com.starrocks.catalog.PartitionKey;
+import com.starrocks.sql.ast.SingleRangePartitionDesc;
 import com.starrocks.thrift.TNetworkAddress;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -33,7 +46,7 @@ import org.json.JSONObject;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class EsShardPartitions {
 
@@ -60,7 +73,8 @@ public class EsShardPartitions {
      * @param searchShards the return value of _search_shards
      * @return shardRoutings is used for searching
      */
-    public static EsShardPartitions findShardPartitions(String indexName, String searchShards) throws StarRocksESException {
+    public static EsShardPartitions findShardPartitions(String indexName, String searchShards)
+            throws StarRocksESException {
 
         EsShardPartitions partitions = new EsShardPartitions(indexName);
         JSONObject jsonObject = new JSONObject(searchShards);
@@ -113,7 +127,7 @@ public class EsShardPartitions {
 
     public TNetworkAddress randomAddress(Map<String, EsNodeInfo> nodesInfo) {
         // return a random value between 0 and 32767 : [0, 32767)
-        int seed = new Random().nextInt(Short.MAX_VALUE) % nodesInfo.size();
+        int seed = ThreadLocalRandom.current().nextInt(Short.MAX_VALUE) % nodesInfo.size();
         EsNodeInfo[] nodeInfos = nodesInfo.values().toArray(new EsNodeInfo[0]);
         return nodeInfos[seed].getPublishAddress();
     }

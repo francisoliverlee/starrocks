@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/routineload/KafkaTaskInfo.java
 
@@ -24,7 +37,6 @@ package com.starrocks.load.routineload;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableMap;
 import com.google.gson.Gson;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
@@ -32,6 +44,7 @@ import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.DebugUtil;
 import com.starrocks.common.util.KafkaUtil;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TExecPlanFragmentParams;
 import com.starrocks.thrift.TFileFormatType;
 import com.starrocks.thrift.TKafkaLoadInfo;
@@ -50,7 +63,7 @@ import java.util.UUID;
 public class KafkaTaskInfo extends RoutineLoadTaskInfo {
     private static final Logger LOG = LogManager.getLogger(KafkaTaskInfo.class);
 
-    private RoutineLoadManager routineLoadManager = Catalog.getCurrentCatalog().getRoutineLoadManager();
+    private RoutineLoadManager routineLoadManager = GlobalStateMgr.getCurrentState().getRoutineLoadManager();
 
     // <partitionId, beginOffsetOfPartitionId>
     private Map<Integer, Long> partitionIdToOffset;
@@ -59,14 +72,14 @@ public class KafkaTaskInfo extends RoutineLoadTaskInfo {
     // offset is the latest existing message offset + 1
     private Map<Integer, Long> latestPartOffset;
 
-    public KafkaTaskInfo(UUID id, long jobId, String clusterName, long taskScheduleIntervalMs, long timeToExecuteMs,
+    public KafkaTaskInfo(UUID id, long jobId, long taskScheduleIntervalMs, long timeToExecuteMs,
                          Map<Integer, Long> partitionIdToOffset) {
-        super(id, jobId, clusterName, taskScheduleIntervalMs, timeToExecuteMs);
+        super(id, jobId, taskScheduleIntervalMs, timeToExecuteMs);
         this.partitionIdToOffset = partitionIdToOffset;
     }
 
     public KafkaTaskInfo(long timeToExecuteMs, KafkaTaskInfo kafkaTaskInfo, Map<Integer, Long> partitionIdToOffset) {
-        super(UUID.randomUUID(), kafkaTaskInfo.getJobId(), kafkaTaskInfo.getClusterName(),
+        super(UUID.randomUUID(), kafkaTaskInfo.getJobId(),
                 kafkaTaskInfo.getTaskScheduleIntervalMs(), timeToExecuteMs, kafkaTaskInfo.getBeId());
         this.partitionIdToOffset = partitionIdToOffset;
     }
@@ -133,7 +146,7 @@ public class KafkaTaskInfo extends RoutineLoadTaskInfo {
         tRoutineLoadTask.setId(queryId);
         tRoutineLoadTask.setJob_id(jobId);
         tRoutineLoadTask.setTxn_id(txnId);
-        Database database = Catalog.getCurrentCatalog().getDb(routineLoadJob.getDbId());
+        Database database = GlobalStateMgr.getCurrentState().getDb(routineLoadJob.getDbId());
         if (database == null) {
             throw new MetaNotFoundException("database " + routineLoadJob.getDbId() + " does not exist");
         }
@@ -153,6 +166,9 @@ public class KafkaTaskInfo extends RoutineLoadTaskInfo {
         tKafkaLoadInfo.setBrokers((routineLoadJob).getBrokerList());
         tKafkaLoadInfo.setPartition_begin_offset(partitionIdToOffset);
         tKafkaLoadInfo.setProperties(routineLoadJob.getConvertedCustomProperties());
+        if ((routineLoadJob).getConfluentSchemaRegistryUrl() != null) {
+            tKafkaLoadInfo.setConfluent_schema_registry_url((routineLoadJob).getConfluentSchemaRegistryUrl());
+        }
         tRoutineLoadTask.setKafka_load_info(tKafkaLoadInfo);
         tRoutineLoadTask.setType(TLoadSourceType.KAFKA);
         tRoutineLoadTask.setParams(plan(routineLoadJob));
@@ -161,6 +177,8 @@ public class KafkaTaskInfo extends RoutineLoadTaskInfo {
         tRoutineLoadTask.setMax_batch_size(Config.max_routine_load_batch_size);
         if (!routineLoadJob.getFormat().isEmpty() && routineLoadJob.getFormat().equalsIgnoreCase("json")) {
             tRoutineLoadTask.setFormat(TFileFormatType.FORMAT_JSON);
+        } else if (!routineLoadJob.getFormat().isEmpty() && routineLoadJob.getFormat().equalsIgnoreCase("avro")) {
+            tRoutineLoadTask.setFormat(TFileFormatType.FORMAT_AVRO);
         } else {
             tRoutineLoadTask.setFormat(TFileFormatType.FORMAT_CSV_PLAIN);
         }

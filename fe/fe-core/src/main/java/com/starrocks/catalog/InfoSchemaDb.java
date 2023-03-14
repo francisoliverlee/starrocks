@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/InfoSchemaDb.java
 
@@ -21,8 +34,7 @@
 
 package com.starrocks.catalog;
 
-import com.starrocks.cluster.ClusterNamespace;
-import com.starrocks.common.SystemIdGenerator;
+import com.starrocks.common.SystemId;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -33,17 +45,12 @@ public class InfoSchemaDb extends Database {
     public static final String DATABASE_NAME = "information_schema";
 
     public InfoSchemaDb() {
-        super(SystemIdGenerator.getNextId(), DATABASE_NAME);
-        initTables();
-    }
-
-    public InfoSchemaDb(String cluster) {
-        super(SystemIdGenerator.getNextId(), ClusterNamespace.getFullName(cluster, DATABASE_NAME));
+        super(SystemId.INFORMATION_SCHEMA_DB_ID, DATABASE_NAME);
         initTables();
     }
 
     @Override
-    public boolean createTableWithLock(Table table, boolean isReplay, boolean setIfNotExist) {
+    public boolean createTableWithLock(Table table, boolean isReplay) {
         return false;
     }
 
@@ -83,19 +90,14 @@ public class InfoSchemaDb extends Database {
         return super.getTable(name.toLowerCase());
     }
 
-    public static String getFullInfoSchemaDbName(String cluster) {
-        return ClusterNamespace.getFullName(cluster, DATABASE_NAME);
+    public static String getFullInfoSchemaDbName() {
+        return DATABASE_NAME;
     }
 
     public static boolean isInfoSchemaDb(String dbName) {
         if (dbName == null) {
             return false;
         }
-        String[] ele = dbName.split(ClusterNamespace.CLUSTER_DELIMITER);
-        String newDbName = dbName;
-        if (ele.length == 2) {
-            newDbName = ele[1];
-        }
-        return DATABASE_NAME.equalsIgnoreCase(newDbName);
+        return DATABASE_NAME.equalsIgnoreCase(dbName);
     }
 }

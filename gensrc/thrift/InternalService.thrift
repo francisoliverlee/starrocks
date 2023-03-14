@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/InternalService.thrift
 
@@ -31,16 +44,11 @@ include "Planner.thrift"
 include "DataSinks.thrift"
 include "Data.thrift"
 include "RuntimeProfile.thrift"
-
-// constants for TQueryOptions.num_nodes
-const i32 NUM_NODES_ALL = 0
-const i32 NUM_NODES_ALL_RACKS = -1
+include "WorkGroup.thrift"
+include "RuntimeFilter.thrift"
 
 // constants for TPlanNodeId
 const i32 INVALID_PLAN_NODE_ID = -1
-
-// Constant default partition ID, must be < 0 to avoid collisions
-const i64 DEFAULT_PARTITION_ID = -1;
 
 enum TQueryType {
     SELECT,
@@ -48,15 +56,19 @@ enum TQueryType {
     EXTERNAL
 }
 
+enum TLoadJobType {
+    BROKER,
+    SPARK,
+    INSERT_QUERY,
+    INSERT_VALUES,
+    STREAM_LOAD,
+    ROUTINE_LOAD,
+}
+
 enum TErrorHubType {
     MYSQL,
     BROKER,
     NULL_TYPE
-}
-
-enum TPrefetchMode {
-    NONE,
-    HT_BUCKET
 }
 
 struct TMysqlErrorHubInfo {
@@ -80,55 +92,34 @@ struct TLoadErrorHubInfo {
     3: optional TBrokerErrorHubInfo broker_info;
 }
 
+enum TPipelineProfileLevel {
+  CORE_METRICS,
+  ALL_METRICS,
+  DETAIL
+}
+
+enum TSpillMode {
+  AUTO,
+  FORCE
+}
+
+enum TTabletInternalParallelMode {
+  AUTO,
+  FORCE_SPLIT
+}
+
 // Query options with their respective defaults
 struct TQueryOptions {
-  1: optional bool abort_on_error = 0
   2: optional i32 max_errors = 0
-  3: optional bool disable_codegen = 1
   4: optional i32 batch_size = 0
-  5: optional i32 num_nodes = NUM_NODES_ALL
-  6: optional i64 max_scan_range_length = 0
-  7: optional i32 num_scanner_threads = 0
-  8: optional i32 max_io_buffers = 0
-  9: optional bool allow_unsupported_formats = 0
-  10: optional i64 default_order_by_limit = -1
-  11: optional string debug_action = ""
+  
   12: optional i64 mem_limit = 2147483648
   13: optional bool abort_on_default_limit_exceeded = 0
   14: optional i32 query_timeout = 3600
-  15: optional bool is_report_success = 0
-  16: optional i32 codegen_level = 0
-  // INT64::MAX
-  17: optional i64 kudu_latest_observed_ts = 9223372036854775807 // Deprecated
+  15: optional bool enable_profile = 0
+
   18: optional TQueryType query_type = TQueryType.SELECT
-  19: optional i64 min_reservation = 0
-  20: optional i64 max_reservation = 107374182400
-  21: optional i64 initial_reservation_total_claims = 2147483647 // TODO chenhao
-  22: optional i64 buffer_pool_limit = 2147483648
 
-  // The default spillable buffer size in bytes, which may be overridden by the planner.
-  // Defaults to 2MB.
-  23: optional i64 default_spillable_buffer_size = 2097152;
-
-  // The minimum spillable buffer to use. The planner will not choose a size smaller than
-  // this. Defaults to 64KB.
-  24: optional i64 min_spillable_buffer_size = 65536;
-
-  // The maximum size of row that the query will reserve memory to process. Processing
-  // rows larger than this may result in a query failure. Defaults to 512KB, e.g.
-  // enough for a row with 15 32KB strings or many smaller columns.
-  //
-  // Different operators handle this option in different ways. E.g. some simply increase
-  // the size of all their buffers to fit this row size, whereas others may use more
-  // sophisticated strategies - e.g. reserving a small number of buffers large enough to
-  // fit maximum-sized rows.
-  25: optional i64 max_row_size = 524288;
-
-  // stream preaggregation
-  26: optional bool disable_stream_preaggregations = false;
-
-  // multithreaded degree of intra-node parallelism
-  27: optional i32 mt_dop = 0;
   // if this is a query option for LOAD, load_mem_limit should be set to limit the mem comsuption
   // of load channel.
   28: optional i64 load_mem_limit = 0;
@@ -138,20 +129,56 @@ struct TQueryOptions {
   // see BE config `max_pushdown_conditions_per_column` for details
   // if set, this will overwrite the BE config.
   30: optional i32 max_pushdown_conditions_per_column
-  // whether enable spilling to disk
-  31: optional bool enable_spilling = false;
+  // whether enable spill to disk
+  31: optional bool enable_spill = false;
 
-  // Added by StarRocks:
   50: optional Types.TCompressionType transmission_compression_type;
+
   51: optional i64 runtime_join_filter_pushdown_limit;
   // Timeout in ms to wait until runtime filters are arrived.
   52: optional i32 runtime_filter_wait_timeout_ms = 200;
   // Timeout in ms to send runtime filter across nodes.
   53: optional i32 runtime_filter_send_timeout_ms = 400;
   // For pipeline query engine
-  54: optional i32 query_threads;
+  54: optional i32 pipeline_dop;
   // For pipeline query engine
-  55: optional i32 pipeline_scan_mode;
+  55: optional TPipelineProfileLevel pipeline_profile_level;
+  // For load degree of parallel
+  56: optional i32 load_dop;
+  57: optional i64 runtime_filter_scan_wait_time_ms;
+
+  58: optional i64 query_mem_limit;
+
+  59: optional bool enable_tablet_internal_parallel;
+
+  60: optional i32 query_delivery_timeout;
+  
+  61: optional bool enable_query_debug_trace;
+
+  62: optional Types.TCompressionType load_transmission_compression_type;
+
+  63: optional TTabletInternalParallelMode tablet_internal_parallel_mode;
+
+  64: optional TLoadJobType load_job_type
+
+  66: optional bool use_scan_block_cache;
+
+  67: optional bool enable_pipeline_query_statistic = false;
+
+  68: optional i32 transmission_encode_level;
+  
+  69: optional bool enable_populate_block_cache;
+
+  70: optional bool allow_throw_exception = 0;
+
+  71: optional bool hudi_mor_force_jni_reader;
+
+  72: optional i32 spill_mem_table_size;
+  73: optional i32 spill_mem_table_num;
+  74: optional double spill_mem_limit_threshold;
+  75: optional i64 spill_operator_min_bytes;
+  76: optional TSpillMode spill_mode;
+
 }
 
 
@@ -159,32 +186,6 @@ struct TQueryOptions {
 struct TScanRangeParams {
   1: required PlanNodes.TScanRange scan_range
   2: optional i32 volume_id = -1
-}
-
-struct TRuntimeFilterProberParams {
-  1: optional Types.TUniqueId fragment_instance_id
-  2: optional Types.TNetworkAddress fragment_instance_address
-}
-
-struct TRuntimeFilterParams {
-  // Runtime filter Id to the fragment instances where that runtime filter will be applied on
-  2: optional map<i32, list<TRuntimeFilterProberParams>> id_to_prober_params
-  // Runtime filter Id to (number of partitioned runtime filters)
-  // To merge a global runtime filter, merge node has to merge
-  // all partitioned runtime filters for the sake of correctness.
-  3: optional map<i32, i32> runtime_filter_builder_number
-  // if aggregated runtime filter size exceeds it, merge node can stop merging.
-  4: optional i64 runtime_filter_max_size;
-}
-
-// Specification of one output destination of a plan fragment
-struct TPlanFragmentDestination {
-  // the globally unique fragment instance id
-  1: required Types.TUniqueId fragment_instance_id
-
-  // ... which is being executed on this server
-  2: required Types.TNetworkAddress server
-  3: optional Types.TNetworkAddress brpc_server
 }
 
 // Parameters for a single execution instance of a particular TPlanFragment
@@ -208,7 +209,7 @@ struct TPlanFragmentExecParams {
   // The partitioning of the output is specified by
   // TPlanFragment.output_sink.output_partition.
   // The number of output partitions is destinations.size().
-  5: list<TPlanFragmentDestination> destinations
+  5: list<DataSinks.TPlanFragmentDestination> destinations
 
   // Debug options: perform some action in a particular phase of a particular node
   6: optional Types.TPlanNodeId debug_node_id
@@ -222,8 +223,16 @@ struct TPlanFragmentExecParams {
   12: optional bool use_vectorized // whether to use vectorized query engine
 
   // Global runtime filters
-  50: optional TRuntimeFilterParams runtime_filter_params
+  50: optional RuntimeFilter.TRuntimeFilterParams runtime_filter_params
   51: optional i32 instances_number
+  // To enable pass through chunks between sink/exchange if they are in the same process.
+  52: optional bool enable_exchange_pass_through
+
+  53: optional map<Types.TPlanNodeId, map<i32, list<TScanRangeParams>>> node_to_per_driver_seq_scan_ranges
+
+  54: optional bool enable_exchange_perf
+
+  70: optional i32 pipeline_sink_dop
 }
 
 // Global query parameters assigned by the coordinator.
@@ -250,6 +259,11 @@ struct TQueryGlobals {
 
 enum InternalServiceVersion {
   V1
+}
+
+struct TAdaptiveDopParam {
+  1: optional i64 max_block_rows_per_driver_seq
+  2: optional i64 max_output_amplification_factor
 }
 
 // ExecPlanFragment
@@ -285,7 +299,7 @@ struct TExecPlanFragmentParams {
 
   // Whether reportd when the backend fails
   // required in V1
-  9: optional bool is_report_success
+  9: optional bool enable_profile
 
   // required in V1
   10: optional Types.TResourceInfo resource_info
@@ -297,11 +311,31 @@ struct TExecPlanFragmentParams {
   14: optional TLoadErrorHubInfo load_error_hub_info
 
   50: optional bool is_pipeline
+  51: optional i32 pipeline_dop
+  52: optional map<Types.TPlanNodeId, i32> per_scan_node_dop
+
+  53: optional WorkGroup.TWorkGroup workgroup
+  54: optional bool enable_resource_group
+  55: optional i32 func_version
+  
+  // Sharing data between drivers of same scan operator
+  56: optional bool enable_shared_scan
+
+  57: optional bool is_stream_pipeline
+
+  58: optional TAdaptiveDopParam adaptive_dop_param
 }
 
 struct TExecPlanFragmentResult {
   // required in V1
   1: optional Status.TStatus status
+}
+
+struct TExecBatchPlanFragmentsParams {
+  // required in V1
+  1: optional TExecPlanFragmentParams common_param
+  // required in V1
+  2: optional list<TExecPlanFragmentParams> unique_param_per_instance
 }
 
 // CancelPlanFragment
@@ -353,64 +387,6 @@ struct TTransmitDataResult {
   4: optional Types.TPlanNodeId dest_node_id
 }
 
-struct TTabletWithPartition {
-    1: required i64 partition_id
-    2: required i64 tablet_id
-}
-
-// open a tablet writer
-struct TTabletWriterOpenParams {
-    1: required Types.TUniqueId id
-    2: required i64 index_id
-    3: required i64 txn_id
-    4: required Descriptors.TOlapTableSchemaParam schema
-    5: required list<TTabletWithPartition> tablets
-
-    6: required i32 num_senders
-}
-
-struct TTabletWriterOpenResult {
-    1: required Status.TStatus status
-}
-
-// add batch to tablet writer
-struct TTabletWriterAddBatchParams {
-    1: required Types.TUniqueId id
-    2: required i64 index_id
-
-    3: required i64 packet_seq
-    4: required list<Types.TTabletId> tablet_ids
-    5: required Data.TRowBatch row_batch
-
-    6: required i32 sender_no
-}
-
-struct TTabletWriterAddBatchResult {
-    1: required Status.TStatus status
-}
-
-struct TTabletWriterCloseParams {
-    1: required Types.TUniqueId id
-    2: required i64 index_id
-
-    3: required i32 sender_no
-}
-
-struct TTabletWriterCloseResult {
-    1: required Status.TStatus status
-}
-
-//
-struct TTabletWriterCancelParams {
-    1: required Types.TUniqueId id
-    2: required i64 index_id
-
-    3: required i32 sender_no
-}
-
-struct TTabletWriterCancelResult {
-}
-
 struct TFetchDataParams {
   1: required InternalServiceVersion protocol_version
   // required in V1
@@ -442,3 +418,4 @@ struct TExportStatusResult {
     2: required Types.TExportState state
     3: optional list<string> files
 }
+

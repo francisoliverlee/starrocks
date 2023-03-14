@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/http/TableQueryPlanActionTest.java
 
@@ -34,10 +47,11 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.util.Base64;
+import java.util.Objects;
 
 public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
 
-    private static String PATH_URI = "/_query_plan";
+    private static final String PATH_URI = "/_query_plan";
     protected static String ES_TABLE_URL;
 
     @Override
@@ -49,6 +63,7 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
 
     @Test
     public void testQueryPlanAction() throws IOException, TException {
+        super.setUpWithCatalog();
         RequestBody body =
                 RequestBody.create(JSON, "{ \"sql\" :  \" select k1,k2 from " + DB_NAME + "." + TABLE_NAME + " \" }");
         Request request = new Request.Builder()
@@ -57,7 +72,7 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
                 .url(URI + PATH_URI)
                 .build();
         Response response = networkClient.newCall(request).execute();
-        String respStr = response.body().string();
+        String respStr = Objects.requireNonNull(response.body()).string();
         JSONObject jsonObject = new JSONObject(respStr);
         System.out.println(respStr);
         Assert.assertEquals(200, jsonObject.getInt("status"));
@@ -69,7 +84,6 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
             Assert.assertNotNull(tabletObject.getJSONArray("routings"));
             Assert.assertEquals(3, tabletObject.getJSONArray("routings").length());
             Assert.assertEquals(testStartVersion, tabletObject.getLong("version"));
-            Assert.assertEquals(testStartVersionHash, tabletObject.getLong("versionHash"));
             Assert.assertEquals(testSchemaHash, tabletObject.getLong("schemaHash"));
 
         }
@@ -84,16 +98,16 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
     }
 
     @Test
-    public void testInconsistentResource() throws IOException {
+    public void testNoSqlFailure() throws IOException {
         RequestBody body = RequestBody
-                .create(JSON, "{ \"sql\" :  \" select k1,k2 from " + DB_NAME + "." + TABLE_NAME + 1 + " \" }");
+                .create(JSON, "{}");
         Request request = new Request.Builder()
                 .post(body)
                 .addHeader("Authorization", rootAuth)
                 .url(URI + PATH_URI)
                 .build();
         Response response = networkClient.newCall(request).execute();
-        String respStr = response.body().string();
+        String respStr = Objects.requireNonNull(response.body()).string();
         System.out.println(respStr);
         Assert.assertNotNull(respStr);
         expectThrowsNoException(() -> new JSONObject(respStr));
@@ -101,7 +115,7 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
         Assert.assertEquals(400, jsonObject.getInt("status"));
         String exception = jsonObject.getString("exception");
         Assert.assertNotNull(exception);
-        Assert.assertTrue(exception.startsWith("requested database and table must consistent with sql"));
+        Assert.assertEquals("POST body must contains [sql] root object", exception);
     }
 
     @Test
@@ -114,7 +128,7 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
                 .url(ES_TABLE_URL + PATH_URI)
                 .build();
         Response response = networkClient.newCall(request).execute();
-        String respStr = response.body().string();
+        String respStr = Objects.requireNonNull(response.body()).string();
         Assert.assertNotNull(respStr);
         expectThrowsNoException(() -> new JSONObject(respStr));
         JSONObject jsonObject = new JSONObject(respStr);
@@ -134,7 +148,7 @@ public class TableQueryPlanActionTest extends StarRocksHttpTestCase {
                 .url(ES_TABLE_URL + PATH_URI)
                 .build();
         Response response = networkClient.newCall(request).execute();
-        String respStr = response.body().string();
+        String respStr = Objects.requireNonNull(response.body()).string();
         Assert.assertNotNull(respStr);
         expectThrowsNoException(() -> new JSONObject(respStr));
         JSONObject jsonObject = new JSONObject(respStr);

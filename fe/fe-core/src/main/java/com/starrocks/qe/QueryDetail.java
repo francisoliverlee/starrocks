@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/QueryDetail.java
 
@@ -21,6 +34,7 @@
 
 package com.starrocks.qe;
 
+
 import java.io.Serializable;
 
 public class QueryDetail implements Serializable {
@@ -30,8 +44,6 @@ public class QueryDetail implements Serializable {
         FAILED,
         CANCELLED
     }
-
-    ;
 
     // When query received, FE will construct a QueryDetail
     // object. This object will set queryId, startTime, sql
@@ -59,13 +71,14 @@ public class QueryDetail implements Serializable {
     private String errorMessage;
     private String explain;
     private String profile;
+    private String resourceGroupName;
 
     public QueryDetail() {
     }
 
     public QueryDetail(String queryId, boolean isQuery, int connId, String remoteIP,
                        long startTime, long endTime, long latency, QueryMemState state,
-                       String database, String sql, String user) {
+                       String database, String sql, String user, String resourceGroupName) {
         this.queryId = queryId;
         this.isQuery = isQuery;
         this.connId = connId;
@@ -78,7 +91,11 @@ public class QueryDetail implements Serializable {
             this.database = "";
         } else {
             String[] stringPieces = database.split(":", -1);
-            this.database = stringPieces[1]; // eliminate cluster name
+            if (stringPieces.length == 1) {
+                this.database = stringPieces[0];
+            } else {
+                this.database = stringPieces[1]; // eliminate cluster name
+            }
         }
         this.sql = sql;
         this.user = user;
@@ -214,5 +231,13 @@ public class QueryDetail implements Serializable {
 
     public void setProfile(String profile) {
         this.profile = profile;
+    }
+
+    public String getResourceGroupName() {
+        return resourceGroupName;
+    }
+
+    public void setResourceGroupName(String workGroupName) {
+        this.resourceGroupName = workGroupName;
     }
 }

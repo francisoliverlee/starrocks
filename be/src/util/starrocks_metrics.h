@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/doris_metrics.h
 
@@ -19,8 +32,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef STARROCKS_BE_SRC_COMMON_UTIL_STARROCKS_METRICS_H
-#define STARROCKS_BE_SRC_COMMON_UTIL_STARROCKS_METRICS_H
+#pragma once
 
 #include <set>
 #include <string>
@@ -81,6 +93,10 @@ public:
     METRIC_DEFINE_INT_COUNTER(report_disk_requests_failed, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(report_task_requests_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(report_task_requests_failed, MetricUnit::REQUESTS);
+    METRIC_DEFINE_INT_COUNTER(report_workgroup_requests_total, MetricUnit::REQUESTS);
+    METRIC_DEFINE_INT_COUNTER(report_workgroup_requests_failed, MetricUnit::REQUESTS);
+    METRIC_DEFINE_INT_COUNTER(report_resource_usage_requests_total, MetricUnit::REQUESTS);
+    METRIC_DEFINE_INT_COUNTER(report_resource_usage_requests_failed, MetricUnit::REQUESTS);
 
     METRIC_DEFINE_INT_COUNTER(schema_change_requests_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(schema_change_requests_failed, MetricUnit::REQUESTS);
@@ -135,6 +151,10 @@ public:
     METRIC_DEFINE_INT_COUNTER(txn_commit_request_total, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(txn_rollback_request_total, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(txn_exec_plan_total, MetricUnit::OPERATIONS);
+
+    METRIC_DEFINE_INT_COUNTER(txn_persist_total, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(txn_persist_duration_us, MetricUnit::MICROSECONDS);
+
     METRIC_DEFINE_INT_COUNTER(stream_receive_bytes_total, MetricUnit::BYTES);
     METRIC_DEFINE_INT_COUNTER(stream_load_rows_total, MetricUnit::ROWS);
     METRIC_DEFINE_INT_COUNTER(load_rows_total, MetricUnit::ROWS);
@@ -181,9 +201,11 @@ public:
     METRIC_DEFINE_INT_GAUGE(max_network_send_bytes_rate, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(max_network_receive_bytes_rate, MetricUnit::BYTES);
 
+#ifndef USE_JEMALLOC
     METRIC_DEFINE_TCMALLOC_GAUGE(tcmalloc_total_bytes_reserved, "generic.heap_size");
     METRIC_DEFINE_TCMALLOC_GAUGE(tcmalloc_pageheap_unmapped_bytes, "tcmalloc.pageheap_unmapped_bytes");
     METRIC_DEFINE_TCMALLOC_GAUGE(tcmalloc_bytes_in_use, "generic.current_allocated_bytes");
+#endif
 
     // Metrics related with BlockManager
     METRIC_DEFINE_INT_COUNTER(readable_blocks_total, MetricUnit::BLOCKS);
@@ -244,5 +266,3 @@ private:
 };
 
 }; // namespace starrocks
-
-#endif

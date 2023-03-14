@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/CreateRoutineLoadStmtTest.java
 
@@ -23,17 +36,29 @@ package com.starrocks.analysis;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
 import com.starrocks.load.routineload.KafkaProgress;
 import com.starrocks.load.routineload.LoadDataSourceType;
-import mockit.Injectable;
-import mockit.Mock;
-import mockit.MockUp;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.analyzer.AstToStringBuilder;
+import com.starrocks.sql.analyzer.CreateRoutineLoadAnalyzer;
+import com.starrocks.sql.ast.ColumnSeparator;
+import com.starrocks.sql.ast.CreateRoutineLoadStmt;
+import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.sql.ast.PartitionNames;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.utframe.StarRocksAssert;
+import com.starrocks.utframe.UtFrameUtils;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.util.ArrayList;
@@ -44,8 +69,172 @@ public class CreateRoutineLoadStmtTest {
 
     private static final Logger LOG = LogManager.getLogger(CreateRoutineLoadStmtTest.class);
 
+    private static ConnectContext connectContext;
+    private static StarRocksAssert starRocksAssert;
+
+    @BeforeClass
+    public static void beforeClass() throws Exception {
+        FeConstants.runningUnitTest = true;
+        FeConstants.default_scheduler_interval_millisecond = 100;
+        Config.dynamic_partition_enable = true;
+        Config.dynamic_partition_check_interval_seconds = 1;
+        UtFrameUtils.createMinStarRocksCluster();
+
+        // create connect context
+        connectContext = UtFrameUtils.createDefaultCtx();
+        starRocksAssert = new StarRocksAssert(connectContext);
+
+        starRocksAssert.withDatabase("test").useDatabase("test");
+    }
+
     @Test
-    public void testAnalyzeWithDuplicateProperty(@Injectable Analyzer analyzer) throws UserException {
+    public void testParser() {
+        String sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1\n"
+                + "WHERE k1 > 100 and k2 like \"%starrocks%\",\n"
+                + "COLUMNS(k1, k2, k3 = k1 + k2),\n"
+                + "COLUMNS TERMINATED BY \"\\t\",\n"
+                + "PARTITION(p1,p2) \n"
+                + "PROPERTIES\n"
+                + "(\n"
+                + "\"desired_concurrent_number\"=\"3\",\n"
+                + "\"max_batch_interval\" = \"20\",\n"
+                + "\"strict_mode\" = \"false\",\n"
+                + "\"timezone\" = \"Asia/Shanghai\"\n"
+                + ")\n"
+                + "FROM KAFKA\n"
+                + "(\n"
+                + "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\",\n"
+                + "\"confluent.schema.registry.url\" = \"https://user:password@confluent.west.us\",\n"
+                + "\"kafka_topic\" = \"topictest\"\n"
+                + ");";
+        List<StatementBase> stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        CreateRoutineLoadStmt createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        List<String> partitionNames = new ArrayList<>();
+        partitionNames.add("p1");
+        partitionNames.add("p2");
+        Assert.assertNotNull(createRoutineLoadStmt.getRoutineLoadDesc());
+        Assert.assertEquals("\t", createRoutineLoadStmt.getRoutineLoadDesc().getColumnSeparator().getColumnSeparator());
+        Assert.assertEquals(partitionNames,
+                createRoutineLoadStmt.getRoutineLoadDesc().getPartitionNames().getPartitionNames());
+        Assert.assertEquals(3, createRoutineLoadStmt.getDesiredConcurrentNum());
+        Assert.assertEquals(20, createRoutineLoadStmt.getMaxBatchIntervalS());
+        Assert.assertEquals("kafkahost1:9092,kafkahost2:9092", createRoutineLoadStmt.getKafkaBrokerList());
+        Assert.assertEquals("topictest", createRoutineLoadStmt.getKafkaTopic());
+        Assert.assertEquals("Asia/Shanghai", createRoutineLoadStmt.getTimezone());
+        Assert.assertEquals("https://user:password@confluent.west.us", createRoutineLoadStmt.getConfluentSchemaRegistryUrl());
+    }
+
+    @Test
+    public void testLoadPropertiesContexts() {
+        String sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1"
+                + " PROPERTIES( \"desired_concurrent_number\"=\"3\",\n"
+                + "\"max_batch_interval\" = \"20\",\n"
+                + "\"strict_mode\" = \"false\",\n"
+                + "\"timezone\" = \"Asia/Shanghai\"\n"
+                + ")\n"
+                + "FROM KAFKA\n"
+                + "(\n"
+                + "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\",\n"
+                + "\"kafka_topic\" = \"topictest\"\n"
+                + ");";
+        List<StatementBase> stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        CreateRoutineLoadStmt createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertNotNull(createRoutineLoadStmt.getRoutineLoadDesc());
+        Assert.assertEquals(0, createRoutineLoadStmt.getLoadPropertyList().size());
+    }
+
+    @Test
+    public void testLoadColumns() {
+        String sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1" +
+                " COLUMNS(`k1`, `k2`, `k3`, `k4`, `k5`," +
+                " `v1` = to_bitmap(`k1`))" +
+                " PROPERTIES (\"desired_concurrent_number\"=\"1\")" +
+                " FROM KAFKA (\"kafka_topic\" = \"my_topic\", " +
+                "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\"" +
+                ")";
+        List<StatementBase> stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        CreateRoutineLoadStmt createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(6, createRoutineLoadStmt.getRoutineLoadDesc().getColumnsInfo().getColumns().size());
+
+        sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1" +
+                " COLUMNS(`k1`, `k2`, `k3`, `k4`, `k5`)" +
+                " PROPERTIES (\"desired_concurrent_number\"=\"1\")" +
+                " FROM KAFKA (\"kafka_topic\" = \"my_topic\", " +
+                "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\"" +
+                ")";
+        stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(5, createRoutineLoadStmt.getRoutineLoadDesc().getColumnsInfo().getColumns().size());
+
+        sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1" +
+                " COLUMNS( `v1` = to_bitmap(`k1`)," +
+                " `v2` = to_bitmap(`k2`)," +
+                " `v3` = to_bitmap(`k3`)," +
+                " `v4` = to_bitmap(`k4`)," +
+                " `v5` = to_bitmap(`k5`))" +
+                " PROPERTIES (\"desired_concurrent_number\"=\"1\")" +
+                " FROM KAFKA (\"kafka_topic\" = \"my_topic\", " +
+                "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\"" +
+                ")";
+        stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(5, createRoutineLoadStmt.getRoutineLoadDesc().getColumnsInfo().getColumns().size());
+
+        sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1" +
+                " COLUMNS( `v1` = to_bitmap(`k1`)," +
+                " `v2` = to_bitmap(`k2`)," +
+                " `v3` = to_bitmap(`k3`)," +
+                " `v4` = to_bitmap(`k4`)," +
+                " `v5` = to_bitmap(`k5`)," +
+                " `k1`, `k2`, `k3`, `k4`, `k5` )" +
+                " PROPERTIES (\"desired_concurrent_number\"=\"1\")" +
+                " FROM KAFKA (\"kafka_topic\" = \"my_topic\", " +
+                "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\"" +
+                ")";
+        stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(10, createRoutineLoadStmt.getRoutineLoadDesc().getColumnsInfo().getColumns().size());
+
+        sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1" +
+                " COLUMNS( `v1` = to_bitmap(`k1`), `k1`," +
+                " `v2` = to_bitmap(`k2`), `k2`," +
+                " `v3` = to_bitmap(`k3`), `k3`," +
+                " `v4` = to_bitmap(`k4`), `k4`," +
+                " `v5` = to_bitmap(`k5`), `k5`)" +
+                " PROPERTIES (\"desired_concurrent_number\"=\"1\")" +
+                " FROM KAFKA (\"kafka_topic\" = \"my_topic\", " +
+                "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\"" +
+                ")";
+        stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(10, createRoutineLoadStmt.getRoutineLoadDesc().getColumnsInfo().getColumns().size());
+
+        sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1" +
+                " COLUMNS(`k1`, `k2`, `k3`, `k4`, `k5`," +
+                " `v1` = to_bitmap(`k1`)," +
+                " `v2` = to_bitmap(`k2`)," +
+                " `v3` = to_bitmap(`k3`)," +
+                " `v4` = to_bitmap(`k4`)," +
+                " `v5` = to_bitmap(`k5`))" +
+                " PROPERTIES (\"desired_concurrent_number\"=\"1\")" +
+                " FROM KAFKA (\"kafka_topic\" = \"my_topic\", " +
+                "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\"" +
+                ")";
+        stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
+        createRoutineLoadStmt = (CreateRoutineLoadStmt)stmts.get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(10, createRoutineLoadStmt.getRoutineLoadDesc().getColumnsInfo().getColumns().size());
+    }
+
+    @Test
+    public void testAnalyzeWithDuplicateProperty() throws UserException {
         String jobName = "job1";
         String dbName = "db1";
         LabelName labelName = new LabelName(dbName, jobName);
@@ -74,24 +263,16 @@ public class CreateRoutineLoadStmtTest {
         CreateRoutineLoadStmt createRoutineLoadStmt = new CreateRoutineLoadStmt(labelName, tableNameString,
                 loadPropertyList, properties,
                 typeName, customProperties);
-
-        new MockUp<StatementBase>() {
-            @Mock
-            public void analyze(Analyzer analyzer1) {
-                return;
-            }
-        };
-
         try {
-            createRoutineLoadStmt.analyze(analyzer);
+            CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
             Assert.fail();
-        } catch (AnalysisException e) {
+        } catch (RuntimeException e) {
             LOG.info(e.getMessage());
         }
     }
 
     @Test
-    public void testAnalyze(@Injectable Analyzer analyzer) throws UserException {
+    public void testAnalyze() {
         String jobName = "job1";
         String dbName = "db1";
         LabelName labelName = new LabelName(dbName, jobName);
@@ -123,14 +304,8 @@ public class CreateRoutineLoadStmtTest {
         CreateRoutineLoadStmt createRoutineLoadStmt = new CreateRoutineLoadStmt(labelName, tableNameString,
                 loadPropertyList, properties,
                 typeName, customProperties);
-        new MockUp<StatementBase>() {
-            @Mock
-            public void analyze(Analyzer analyzer1) {
-                return;
-            }
-        };
 
-        createRoutineLoadStmt.analyze(analyzer);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
 
         Assert.assertNotNull(createRoutineLoadStmt.getRoutineLoadDesc());
         Assert.assertEquals(columnSeparator, createRoutineLoadStmt.getRoutineLoadDesc().getColumnSeparator());
@@ -144,13 +319,54 @@ public class CreateRoutineLoadStmtTest {
     }
 
     @Test
-    public void testKafkaOffset(@Injectable Analyzer analyzer) throws UserException {
-        new MockUp<StatementBase>() {
-            @Mock
-            public void analyze(Analyzer analyzer1) {
-                return;
-            }
-        };
+    public void testAnalyzeJsonConfig() throws Exception {
+        String createSQL = "CREATE ROUTINE LOAD db0.routine_load_0 ON t1 " +
+                "PROPERTIES(\"format\" = \"json\",\"jsonpaths\"=\"[\\\"$.k1\\\",\\\"$.k2.\\\\\\\"k2.1\\\\\\\"\\\"]\") " +
+                "FROM KAFKA(\"kafka_broker_list\" = \"xxx.xxx.xxx.xxx:xxx\",\"kafka_topic\" = \"topic_0\");";
+        ConnectContext ctx = starRocksAssert.getCtx();
+        CreateRoutineLoadStmt createRoutineLoadStmt = (CreateRoutineLoadStmt) SqlParser.parse(createSQL, 32).get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(createRoutineLoadStmt.getJsonPaths(), "[\"$.k1\",\"$.k2.\\\"k2.1\\\"\"]");
+
+        String selectSQL = "SELECT \"Pat O\"\"Hanrahan & <Matthew Eldridge]\"\"\";";
+        QueryStatement selectStmt = (QueryStatement) UtFrameUtils.parseStmtWithNewParser(selectSQL, ctx);
+
+        Expr expr = ((SelectRelation) (selectStmt.getQueryRelation())).getOutputExpression().get(0);
+        Assert.assertTrue(expr instanceof StringLiteral);
+        StringLiteral stringLiteral = (StringLiteral) expr;
+        Assert.assertEquals(stringLiteral.getValue(), "Pat O\"Hanrahan & <Matthew Eldridge]\"");
+
+    }
+
+    @Test
+    public void testAnalyzeCSVConfig() throws Exception {
+        String createSQL = "CREATE ROUTINE LOAD db0.routine_load_1 ON t1 " +
+                "PROPERTIES(\"format\" = \"csv\", \"trim_space\"=\"true\", \"enclose\"=\"'\", \"escape\"=\"|\") " +
+                "FROM KAFKA(\"kafka_broker_list\" = \"xxx.xxx.xxx.xxx:xxx\",\"kafka_topic\" = \"topic_0\");";
+        ConnectContext ctx = starRocksAssert.getCtx();
+        CreateRoutineLoadStmt createRoutineLoadStmt = (CreateRoutineLoadStmt) SqlParser.parse(createSQL, 32).get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(createRoutineLoadStmt.isTrimspace(), true);
+        Assert.assertEquals(createRoutineLoadStmt.getEnclose(), '\'');
+        Assert.assertEquals(createRoutineLoadStmt.getEscape(), '|');
+    }
+
+    @Test
+    public void testAnalyzeCSVDefalultValue() throws Exception {
+        String createSQL = "CREATE ROUTINE LOAD db0.routine_load_1 ON t1 " +
+                "PROPERTIES(\"max_error_number\" = \"10\") " +
+                "FROM KAFKA(\"kafka_broker_list\" = \"xxx.xxx.xxx.xxx:xxx\",\"kafka_topic\" = \"topic_0\");";
+        ConnectContext ctx = starRocksAssert.getCtx();
+        CreateRoutineLoadStmt createRoutineLoadStmt = (CreateRoutineLoadStmt) SqlParser.parse(createSQL, 32).get(0);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
+        Assert.assertEquals(createRoutineLoadStmt.getMaxErrorNum(), 10);
+        Assert.assertEquals(createRoutineLoadStmt.getEnclose(), 0);
+        Assert.assertEquals(createRoutineLoadStmt.getEscape(), 0);
+        Assert.assertEquals(createRoutineLoadStmt.isTrimspace(), false);
+    }
+
+    @Test
+    public void testKafkaOffset() {
 
         String jobName = "job1";
         String dbName = "db1";
@@ -175,7 +391,7 @@ public class CreateRoutineLoadStmtTest {
         CreateRoutineLoadStmt createRoutineLoadStmt = new CreateRoutineLoadStmt(
                 labelName, tableNameString, loadPropertyList, Maps.newHashMap(),
                 LoadDataSourceType.KAFKA.name(), customProperties);
-        createRoutineLoadStmt.analyze(analyzer);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
         List<Pair<Integer, Long>> partitionOffsets = createRoutineLoadStmt.getKafkaPartitionOffsets();
         Assert.assertEquals(2, partitionOffsets.size());
         Assert.assertEquals(KafkaProgress.OFFSET_BEGINNING_VAL, (long) partitionOffsets.get(0).second);
@@ -189,7 +405,7 @@ public class CreateRoutineLoadStmtTest {
         createRoutineLoadStmt =
                 new CreateRoutineLoadStmt(labelName, tableNameString, loadPropertyList, Maps.newHashMap(),
                         LoadDataSourceType.KAFKA.name(), customProperties);
-        createRoutineLoadStmt.analyze(analyzer);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
         partitionOffsets = createRoutineLoadStmt.getKafkaPartitionOffsets();
         Assert.assertEquals(2, partitionOffsets.size());
         Assert.assertEquals(KafkaProgress.OFFSET_END_VAL, (long) partitionOffsets.get(0).second);
@@ -204,7 +420,7 @@ public class CreateRoutineLoadStmtTest {
         createRoutineLoadStmt =
                 new CreateRoutineLoadStmt(labelName, tableNameString, loadPropertyList, Maps.newHashMap(),
                         LoadDataSourceType.KAFKA.name(), customProperties);
-        createRoutineLoadStmt.analyze(analyzer);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
         partitionOffsets = createRoutineLoadStmt.getKafkaPartitionOffsets();
         Assert.assertEquals(2, partitionOffsets.size());
         Assert.assertEquals(10, (long) partitionOffsets.get(0).second);
@@ -220,12 +436,38 @@ public class CreateRoutineLoadStmtTest {
         createRoutineLoadStmt =
                 new CreateRoutineLoadStmt(labelName, tableNameString, loadPropertyList, Maps.newHashMap(),
                         LoadDataSourceType.KAFKA.name(), customProperties);
-        createRoutineLoadStmt.analyze(analyzer);
+        CreateRoutineLoadAnalyzer.analyze(createRoutineLoadStmt, connectContext);
         partitionOffsets = createRoutineLoadStmt.getKafkaPartitionOffsets();
         Assert.assertEquals(3, partitionOffsets.size());
         Assert.assertEquals(KafkaProgress.OFFSET_BEGINNING_VAL, (long) partitionOffsets.get(0).second);
         Assert.assertEquals(KafkaProgress.OFFSET_END_VAL, (long) partitionOffsets.get(1).second);
         Assert.assertEquals(11, (long) partitionOffsets.get(2).second);
+    }
+
+    @Test
+    public void testToString() {
+        String sql = "CREATE ROUTINE LOAD testdb.routine_name ON table1\n"
+                + "WHERE k1 > 100 and k2 like \"%starrocks%\",\n"
+                + "COLUMNS(k1, k2, k3 = k1 + k2),\n"
+                + "COLUMNS TERMINATED BY \"\\t\",\n"
+                + "PARTITION(p1,p2) \n"
+                + "PROPERTIES\n"
+                + "(\n"
+                + "\"desired_concurrent_number\"=\"3\",\n"
+                + "\"max_batch_interval\" = \"20\",\n"
+                + "\"strict_mode\" = \"false\",\n"
+                + "\"timezone\" = \"Asia/Shanghai\"\n"
+                + ")\n"
+                + "FROM KAFKA\n"
+                + "(\n"
+                + "\"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\",\n"
+                + "\"kafka_topic\" = \"topictest\",\n"
+                + "\"confluent.schema.registry.url\" = \"https://user:password@confluent.west.us\"\n"
+                + ");";
+        ConnectContext ctx = starRocksAssert.getCtx();
+        CreateRoutineLoadStmt stmt = (CreateRoutineLoadStmt) com.starrocks.sql.parser.SqlParser.parse(sql, ctx.getSessionVariable()).get(0);
+        Assert.assertEquals("CREATE ROUTINE LOAD null.null ON table1PROPERTIES ( \"desired_concurrent_number\" = \"3\", \"timezone\" = \"Asia/Shanghai\", \"strict_mode\" = \"false\", \"max_batch_interval\" = \"20\" ) " +
+        "FROM KAFKA ( \"kafka_broker_list\" = \"kafkahost1:9092,kafkahost2:9092\", \"kafka_topic\" = \"topictest\", \"confluent.schema.registry.url\" = \"***\" )", AstToStringBuilder.toString(stmt));
     }
 
     private Map<String, String> getCustomProperties() {

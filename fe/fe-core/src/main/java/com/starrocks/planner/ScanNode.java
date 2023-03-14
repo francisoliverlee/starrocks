@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/ScanNode.java
 
@@ -26,7 +39,6 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.common.UserException;
-import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TScanRangeLocations;
 
 import java.util.List;
@@ -45,24 +57,8 @@ public abstract class ScanNode extends PlanNode {
         this.desc = desc;
     }
 
-    /**
-     * Helper function to parse a "host:port" address string into TNetworkAddress
-     * This is called with ipaddress:port when doing scan range assigment.
-     */
-    protected static TNetworkAddress addressToTNetworkAddress(String address) {
-        TNetworkAddress result = new TNetworkAddress();
-        String[] hostPort = address.split(":");
-        result.hostname = hostPort[0];
-        result.port = Integer.parseInt(hostPort[1]);
-        return result;
-    }
-
     public void setColumnFilters(Map<String, PartitionColumnFilter> columnFilters) {
         this.columnFilters = columnFilters;
-    }
-
-    public void setSortColumn(String column) {
-        sortColumn = column;
     }
 
     /**

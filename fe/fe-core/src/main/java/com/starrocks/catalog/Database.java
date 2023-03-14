@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Database.java
 
@@ -27,7 +40,10 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.cluster.ClusterNamespace;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ErrorCode;
+import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
@@ -35,7 +51,12 @@ import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.DebugUtil;
+import com.starrocks.common.util.QueryableReentrantReadWriteLock;
+import com.starrocks.common.util.Util;
 import com.starrocks.persist.CreateTableInfo;
+import com.starrocks.persist.DropInfo;
+import com.starrocks.server.CatalogMgr;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.SystemInfoService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -43,9 +64,9 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -53,11 +74,11 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
 import java.util.zip.Adler32;
 
 /**
- * Internal representation of db-related metadata. Owned by Catalog instance.
+ * Internal representation of db-related metadata. Owned by GlobalStateMgr instance.
  * Not thread safe.
  * <p/>
  * The static initialization method loadDb is the only way to construct a Db
@@ -73,13 +94,15 @@ public class Database extends MetaObject implements Writable {
     private static final Logger LOG = LogManager.getLogger(Database.class);
 
     // empirical value.
-    // assume that the time a lock is held by thread is less then 100ms
+    // assume that the time a lock is held by thread is less than 100ms
     public static final long TRY_LOCK_TIMEOUT_MS = 100L;
 
     private long id;
+
+    // catalogName is set if the database comes from an external catalog
+    private String catalogName;
     private String fullQualifiedName;
-    private String clusterName;
-    private ReentrantReadWriteLock rwLock;
+    private QueryableReentrantReadWriteLock rwLock;
 
     // table family group map
     private Map<Long, Table> idToTable;
@@ -92,12 +115,13 @@ public class Database extends MetaObject implements Writable {
 
     private volatile long replicaQuotaSize;
 
-    public enum DbState {
-        NORMAL, LINK, MOVE
-    }
+    private long lastSlowLockLogTime = 0;
 
-    private String attachDbName;
-    private DbState dbState;
+    // This param is used to make sure db not dropped when leader node writes wal,
+    // so this param dose not need to be persistent,
+    // and this param maybe not right when the db is dropped and the catalog has done a checkpoint,
+    // but that'ok to meet our needs.
+    private volatile boolean exist = true;
 
     public Database() {
         this(0, null);
@@ -109,25 +133,94 @@ public class Database extends MetaObject implements Writable {
         if (this.fullQualifiedName == null) {
             this.fullQualifiedName = "";
         }
-        this.rwLock = new ReentrantReadWriteLock(true);
+        this.rwLock = new QueryableReentrantReadWriteLock(true);
         this.idToTable = new ConcurrentHashMap<>();
         this.nameToTable = new ConcurrentHashMap<>();
-        this.dataQuotaBytes = FeConstants.default_db_data_quota_bytes;
-        this.replicaQuotaSize = FeConstants.default_db_replica_quota_size;
-        this.dbState = DbState.NORMAL;
-        this.attachDbName = "";
-        this.clusterName = "";
+        this.dataQuotaBytes = FeConstants.DEFAULT_DB_DATA_QUOTA_BYTES;
+        this.replicaQuotaSize = FeConstants.DEFAULT_DB_REPLICA_QUOTA_SIZE;
+    }
+
+    private String getOwnerInfo(Thread owner) {
+        if (owner == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("owner id: ").append(owner.getId()).append(", owner name: ")
+                .append(owner.getName()).append(", owner stack: ").append(Util.dumpThread(owner, 50));
+        return sb.toString();
+    }
+
+    private void logSlowLockEventIfNeeded(long startMs, String type, String threadDump) {
+        long endMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        if (endMs - startMs > Config.slow_lock_threshold_ms &&
+                endMs > lastSlowLockLogTime + Config.slow_lock_log_every_ms) {
+            lastSlowLockLogTime = endMs;
+            LOG.warn("slow db lock. type: {}, db id: {}, db name: {}, wait time: {}ms, " +
+                            "former {}, current stack trace: ", type, id, fullQualifiedName, endMs - startMs,
+                    threadDump, new Exception());
+        }
+    }
+
+    private void logTryLockFailureEvent(String type, String threadDump) {
+        LOG.warn("try db lock failed. type: {}, current {}", type, threadDump);
     }
 
     public void readLock() {
+        long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        String threadDump = getOwnerInfo(rwLock.getOwner());
         this.rwLock.readLock().lock();
+        logSlowLockEventIfNeeded(startMs, "readLock", threadDump);
+    }
+
+    // this function make sure lock can only be obtained if the db has not been dropped
+    public boolean readLockAndCheckExist() {
+        long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        String threadDump = getOwnerInfo(rwLock.getOwner());
+        this.rwLock.readLock().lock();
+        logSlowLockEventIfNeeded(startMs, "readLock", threadDump);
+        if (exist) {
+            return true;
+        } else {
+            this.rwLock.readLock().unlock();
+            return false;
+        }
     }
 
     public boolean tryReadLock(long timeout, TimeUnit unit) {
         try {
-            return this.rwLock.readLock().tryLock(timeout, unit);
+            long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+            String threadDump = getOwnerInfo(rwLock.getOwner());
+            if (!this.rwLock.readLock().tryLock(timeout, unit)) {
+                logTryLockFailureEvent("readLock", threadDump);
+                return false;
+            }
+            logSlowLockEventIfNeeded(startMs, "tryReadLock", threadDump);
+            return true;
         } catch (InterruptedException e) {
             LOG.warn("failed to try read lock at db[" + id + "]", e);
+            return false;
+        }
+    }
+
+    // this function make sure lock can only be obtained if the db has not been dropped
+    public boolean tryReadLockAndCheckExist(long timeout, TimeUnit unit) {
+        try {
+            long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+            String threadDump = getOwnerInfo(rwLock.getOwner());
+            if (!this.rwLock.readLock().tryLock(timeout, unit)) {
+                logTryLockFailureEvent("readLock", threadDump);
+                return false;
+            }
+            logSlowLockEventIfNeeded(startMs, "tryReadLock", threadDump);
+            if (exist) {
+                return true;
+            } else {
+                this.rwLock.readLock().unlock();
+                return false;
+            }
+        } catch (InterruptedException e) {
+            LOG.warn("failed to try read lock at db[" + id + "]", e);
+            Thread.currentThread().interrupt();
             return false;
         }
     }
@@ -137,14 +230,61 @@ public class Database extends MetaObject implements Writable {
     }
 
     public void writeLock() {
+        long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        String threadDump = getOwnerInfo(rwLock.getOwner());
         this.rwLock.writeLock().lock();
+        logSlowLockEventIfNeeded(startMs, "writeLock", threadDump);
+    }
+
+    // this function make sure lock can only be obtained if the db has not been dropped
+    public boolean writeLockAndCheckExist() {
+        long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        String threadDump = getOwnerInfo(rwLock.getOwner());
+        this.rwLock.writeLock().lock();
+        logSlowLockEventIfNeeded(startMs, "writeLock", threadDump);
+        if (exist) {
+            return true;
+        } else {
+            this.rwLock.writeLock().unlock();
+            return false;
+        }
     }
 
     public boolean tryWriteLock(long timeout, TimeUnit unit) {
         try {
-            return this.rwLock.writeLock().tryLock(timeout, unit);
+            long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+            String threadDump = getOwnerInfo(rwLock.getOwner());
+            if (!this.rwLock.writeLock().tryLock(timeout, unit)) {
+                logTryLockFailureEvent("writeLock", threadDump);
+                return false;
+            }
+            logSlowLockEventIfNeeded(startMs, "tryWriteLock", threadDump);
+            return true;
         } catch (InterruptedException e) {
             LOG.warn("failed to try write lock at db[" + id + "]", e);
+            return false;
+        }
+    }
+
+    // this function make sure lock can only be obtained if the db has not been dropped
+    public boolean tryWriteLockAndCheckExist(long timeout, TimeUnit unit) {
+        try {
+            long startMs = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+            String threadDump = getOwnerInfo(rwLock.getOwner());
+            if (!this.rwLock.writeLock().tryLock(timeout, unit)) {
+                logTryLockFailureEvent("tryWriteLock", threadDump);
+                return false;
+            }
+            logSlowLockEventIfNeeded(startMs, "tryWriteLock", threadDump);
+            if (exist) {
+                return true;
+            } else {
+                this.rwLock.writeLock().unlock();
+                return false;
+            }
+        } catch (InterruptedException e) {
+            LOG.warn("failed to try write lock at db[" + id + "]", e);
+            Thread.currentThread().interrupt();
             return false;
         }
     }
@@ -159,6 +299,24 @@ public class Database extends MetaObject implements Writable {
 
     public long getId() {
         return id;
+    }
+
+    /**
+     * Get the unique id of database in string format, since we already ensure
+     * the uniqueness of id for internal database, we just convert it to string
+     * and return, for external database it's up to the implementation of connector.
+     *
+     * @return unique id of database in string format
+     */
+    public String getUUID() {
+        if (CatalogMgr.isExternalCatalog(catalogName)) {
+            return catalogName + "." + fullQualifiedName;
+        }
+        return Long.toString(id);
+    }
+
+    public String getOriginName() {
+        return fullQualifiedName;
     }
 
     public String getFullName() {
@@ -209,7 +367,7 @@ public class Database extends MetaObject implements Writable {
         readLock();
         try {
             for (Table table : this.idToTable.values()) {
-                if (table.getType() != TableType.OLAP) {
+                if (!table.isLocalTable()) {
                     continue;
                 }
 
@@ -227,7 +385,7 @@ public class Database extends MetaObject implements Writable {
         readLock();
         try {
             for (Table table : this.idToTable.values()) {
-                if (table.getType() != TableType.OLAP) {
+                if (!table.isLocalTable()) {
                     continue;
                 }
 
@@ -278,26 +436,25 @@ public class Database extends MetaObject implements Writable {
         checkReplicaQuota();
     }
 
-    public boolean createTableWithLock(Table table, boolean isReplay, boolean setIfNotExist) {
-        boolean result = true;
+    // return false if table already exists
+    public boolean createTableWithLock(Table table, boolean isReplay) {
         writeLock();
         try {
             String tableName = table.getName();
             if (nameToTable.containsKey(tableName)) {
-                result = setIfNotExist;
+                return false;
             } else {
                 idToTable.put(table.getId(), table);
                 nameToTable.put(table.getName(), table);
 
+                table.onCreate();
                 if (!isReplay) {
                     // Write edit log
                     CreateTableInfo info = new CreateTableInfo(fullQualifiedName, table);
-                    Catalog.getCurrentCatalog().getEditLog().logCreateTable(info);
+                    GlobalStateMgr.getCurrentState().getEditLog().logCreateTable(info);
                 }
-
-                table.onCreate();
             }
-            return result;
+            return true;
         } finally {
             writeUnlock();
         }
@@ -313,6 +470,67 @@ public class Database extends MetaObject implements Writable {
             nameToTable.put(table.getName(), table);
         }
         return result;
+    }
+
+    public void dropTable(String tableName, boolean isSetIfExists, boolean isForce) throws DdlException {
+        Table table;
+        Runnable runnable;
+        writeLock();
+        try {
+            table = getTable(tableName);
+            if (table == null && isSetIfExists) {
+                return;
+            }
+            if (table == null) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_BAD_TABLE_ERROR, tableName);
+                return;
+            }
+            if (!isForce && GlobalStateMgr.getCurrentGlobalTransactionMgr().existCommittedTxns(id, table.getId(), null)) {
+                throw new DdlException("There are still some transactions in the COMMITTED state waiting to be completed. " +
+                        "The table [" + table.getName() +
+                        "] cannot be dropped. If you want to forcibly drop(cannot be recovered)," +
+                        " please use \"DROP TABLE <table> FORCE\".");
+            }
+            runnable = unprotectDropTable(table.getId(), isForce, false);
+            DropInfo info = new DropInfo(id, table.getId(), -1L, isForce);
+            GlobalStateMgr.getCurrentState().getEditLog().logDropTable(info);
+        } finally {
+            writeUnlock();
+        }
+
+        if (runnable != null) {
+            runnable.run();
+        }
+        LOG.info("finished dropping table: {}, type:{} from db: {}, is force: {}", tableName, table.getType(), fullQualifiedName,
+                isForce);
+    }
+
+    public Runnable unprotectDropTable(long tableId, boolean isForceDrop, boolean isReplay) {
+        Runnable runnable;
+        Table table = getTable(tableId);
+        // delete from db meta
+        if (table == null) {
+            return null;
+        }
+
+        if (table instanceof OlapTable && table.hasAutoIncrementColumn()) {
+            GlobalStateMgr.getCurrentState().removeAutoIncrementIdByTableId(tableId, isReplay);
+            ((OlapTable) table).sendDropAutoIncrementMapTask();
+        }
+
+        table.onDrop(this, isForceDrop, isReplay);
+
+        dropTable(table.getName());
+
+        if (!isForceDrop) {
+            Table oldTable = GlobalStateMgr.getCurrentState().getRecycleBin().recycleTable(id, table);
+            runnable = (oldTable != null) ? oldTable.delete(isReplay) : null;
+        } else {
+            runnable = table.delete(isReplay);
+        }
+
+        LOG.info("finished dropping table[{}] in db[{}], tableId: {}", table.getName(), getOriginName(), tableId);
+        return runnable;
     }
 
     public void dropTableWithLock(String tableName) {
@@ -336,6 +554,29 @@ public class Database extends MetaObject implements Writable {
         }
     }
 
+    public boolean createMaterializedWithLock(MaterializedView materializedView, boolean isReplay) {
+        writeLock();
+        try {
+            String mvName = materializedView.getName();
+            if (nameToTable.containsKey(mvName)) {
+                return false;
+            } else {
+                idToTable.put(materializedView.getId(), materializedView);
+                nameToTable.put(materializedView.getName(), materializedView);
+                // There are many checks in onCreate. If these checks fail, the log should not be written,
+                // so it should be placed in front of the log
+                materializedView.onCreate();
+                if (!isReplay) {
+                    CreateTableInfo info = new CreateTableInfo(fullQualifiedName, materializedView);
+                    GlobalStateMgr.getCurrentState().getEditLog().logCreateMaterializedView(info);
+                }
+            }
+            return true;
+        } finally {
+            writeUnlock();
+        }
+    }
+
     public List<Table> getTables() {
         return new ArrayList<Table>(idToTable.values());
     }
@@ -350,10 +591,20 @@ public class Database extends MetaObject implements Writable {
         return views;
     }
 
-    public Set<String> getTableNamesWithLock() {
+    public List<MaterializedView> getMaterializedViews() {
+        List<MaterializedView> materializedViews = new ArrayList<>();
+        for (Table table : idToTable.values()) {
+            if (table.isMaterializedView()) {
+                materializedViews.add((MaterializedView) table);
+            }
+        }
+        return materializedViews;
+    }
+
+    public Set<String> getTableNamesViewWithLock() {
         readLock();
         try {
-            return new HashSet<>(this.nameToTable.keySet());
+            return Collections.unmodifiableSet(this.nameToTable.keySet());
         } finally {
             readUnlock();
         }
@@ -376,28 +627,6 @@ public class Database extends MetaObject implements Writable {
         return idToTable.get(tableId);
     }
 
-    public int getMaxReplicationNum() {
-        int ret = 0;
-        readLock();
-        try {
-            for (Table table : idToTable.values()) {
-                if (table.getType() != TableType.OLAP) {
-                    continue;
-                }
-                OlapTable olapTable = (OlapTable) table;
-                for (Partition partition : olapTable.getAllPartitions()) {
-                    short replicationNum = olapTable.getPartitionInfo().getReplicationNum(partition.getId());
-                    if (ret < replicationNum) {
-                        ret = replicationNum;
-                    }
-                }
-            }
-        } finally {
-            readUnlock();
-        }
-        return ret;
-    }
-
     public static Database read(DataInput in) throws IOException {
         Database db = new Database();
         db.readFields(in);
@@ -408,13 +637,7 @@ public class Database extends MetaObject implements Writable {
     public int getSignature(int signatureVersion) {
         Adler32 adler32 = new Adler32();
         adler32.update(signatureVersion);
-        String charsetName = "UTF-8";
-        try {
-            adler32.update(this.fullQualifiedName.getBytes(charsetName));
-        } catch (UnsupportedEncodingException e) {
-            LOG.error("encoding error", e);
-            return -1;
-        }
+        adler32.update(this.fullQualifiedName.getBytes(StandardCharsets.UTF_8));
         return Math.abs((int) adler32.getValue());
     }
 
@@ -423,7 +646,12 @@ public class Database extends MetaObject implements Writable {
         super.write(out);
 
         out.writeLong(id);
-        Text.writeString(out, fullQualifiedName);
+        // compatible with old version
+        if (fullQualifiedName.isEmpty()) {
+            Text.writeString(out, fullQualifiedName);
+        } else {
+            Text.writeString(out, ClusterNamespace.getFullName(fullQualifiedName));
+        }
         // write tables
         int numTables = nameToTable.size();
         out.writeInt(numTables);
@@ -432,9 +660,11 @@ public class Database extends MetaObject implements Writable {
         }
 
         out.writeLong(dataQuotaBytes);
-        Text.writeString(out, clusterName);
-        Text.writeString(out, dbState.name());
-        Text.writeString(out, attachDbName);
+        Text.writeString(out, SystemInfoService.DEFAULT_CLUSTER);
+        // compatible for dbState
+        Text.writeString(out, "NORMAL");
+        // NOTE: compatible attachDbName
+        Text.writeString(out, "");
 
         // write functions
         out.writeInt(name2Function.size());
@@ -453,10 +683,10 @@ public class Database extends MetaObject implements Writable {
         super.readFields(in);
 
         id = in.readLong();
-        if (Catalog.getCurrentCatalogJournalVersion() < FeMetaVersion.VERSION_30) {
-            fullQualifiedName = ClusterNamespace.getFullName(SystemInfoService.DEFAULT_CLUSTER, Text.readString(in));
-        } else {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_30) {
             fullQualifiedName = Text.readString(in);
+        } else {
+            fullQualifiedName = ClusterNamespace.getNameFromFullName(Text.readString(in));
         }
         // read groups
         int numTables = in.readInt();
@@ -468,15 +698,14 @@ public class Database extends MetaObject implements Writable {
 
         // read quota
         dataQuotaBytes = in.readLong();
-        if (Catalog.getCurrentCatalogJournalVersion() < FeMetaVersion.VERSION_30) {
-            clusterName = SystemInfoService.DEFAULT_CLUSTER;
-        } else {
-            clusterName = Text.readString(in);
-            dbState = DbState.valueOf(Text.readString(in));
-            attachDbName = Text.readString(in);
-        }
+        // Compatible for Cluster
+        Text.readString(in);
+        // Compatible for dbState
+        Text.readString(in);
+        // Compatible for attachDbName
+        Text.readString(in);
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_47) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_47) {
             int numEntries = in.readInt();
             for (int i = 0; i < numEntries; ++i) {
                 String name = Text.readString(in);
@@ -490,11 +719,16 @@ public class Database extends MetaObject implements Writable {
             }
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_81) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_81) {
             replicaQuotaSize = in.readLong();
         } else {
-            replicaQuotaSize = FeConstants.default_db_replica_quota_size;
+            replicaQuotaSize = FeConstants.DEFAULT_DB_REPLICA_QUOTA_SIZE;
         }
+    }
+
+    @Override
+    public int hashCode() {
+        return Long.hashCode(id);
     }
 
     public boolean equals(Object obj) {
@@ -526,40 +760,21 @@ public class Database extends MetaObject implements Writable {
                 && dataQuotaBytes == database.dataQuotaBytes);
     }
 
-    public String getClusterName() {
-        return clusterName;
-    }
-
-    public void setClusterName(String clusterName) {
-        this.clusterName = clusterName;
-    }
-
-    public DbState getDbState() {
-        return dbState;
-    }
-
-    public void setDbState(DbState dbState) {
-        if (dbState == null) {
-            return;
-        }
-        this.dbState = dbState;
-    }
-
-    public void setAttachDb(String name) {
-        this.attachDbName = name;
-    }
-
-    public String getAttachDb() {
-        return this.attachDbName;
-    }
-
     public void setName(String name) {
         this.fullQualifiedName = name;
     }
 
+    public void setCatalogName(String name) {
+        this.catalogName = name;
+    }
+
+    public String getCatalogName() {
+        return catalogName;
+    }
+
     public synchronized void addFunction(Function function) throws UserException {
         addFunctionImpl(function, false);
-        Catalog.getCurrentCatalog().getEditLog().logAddFunction(function);
+        GlobalStateMgr.getCurrentState().getEditLog().logAddFunction(function);
     }
 
     public synchronized void replayAddFunction(Function function) {
@@ -568,6 +783,15 @@ public class Database extends MetaObject implements Writable {
         } catch (UserException e) {
             Preconditions.checkArgument(false);
         }
+    }
+
+    public static void replayCreateFunctionLog(Function function) {
+        String dbName = function.getFunctionName().getDb();
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+        if (db == null) {
+            throw new Error("unknown database when replay log, db=" + dbName);
+        }
+        db.replayAddFunction(function);
     }
 
     // return true if add success, false
@@ -584,8 +808,9 @@ public class Database extends MetaObject implements Writable {
             }
             // Get function id for this UDF, use CatalogIdGenerator. Only get function id
             // when isReplay is false
-            long functionId = Catalog.getCurrentCatalog().getNextId();
-            function.setId(functionId);
+            long functionId = GlobalStateMgr.getCurrentState().getNextId();
+            // all user-defined functions id are negative to avoid conflicts with the builtin function
+            function.setFunctionId(-functionId);
         }
 
         ImmutableList.Builder<Function> builder = ImmutableList.builder();
@@ -598,7 +823,7 @@ public class Database extends MetaObject implements Writable {
 
     public synchronized void dropFunction(FunctionSearchDesc function) throws UserException {
         dropFunctionImpl(function);
-        Catalog.getCurrentCatalog().getEditLog().logDropFunction(function);
+        GlobalStateMgr.getCurrentState().getEditLog().logDropFunction(function);
     }
 
     public synchronized void replayDropFunction(FunctionSearchDesc functionSearchDesc) {
@@ -607,6 +832,31 @@ public class Database extends MetaObject implements Writable {
         } catch (UserException e) {
             Preconditions.checkArgument(false);
         }
+    }
+
+    public static void replayDropFunctionLog(FunctionSearchDesc functionSearchDesc) {
+        String dbName = functionSearchDesc.getName().getDb();
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+        if (db == null) {
+            throw new Error("unknown database when replay log, db=" + dbName);
+        }
+        db.replayDropFunction(functionSearchDesc);
+    }
+
+    public Function getFunction(FunctionSearchDesc function) {
+        String functionName = function.getName().getFunction();
+        List<Function> existFuncs = name2Function.get(functionName);
+        if (existFuncs == null) {
+            return null;
+        }
+        Function func = null;
+        for (Function existFunc : existFuncs) {
+            if (function.isIdentical(existFunc)) {
+                func = existFunc;
+                break;
+            }
+        }
+        return func;
     }
 
     private void dropFunctionImpl(FunctionSearchDesc function) throws UserException {
@@ -652,6 +902,15 @@ public class Database extends MetaObject implements Writable {
     }
 
     public boolean isInfoSchemaDb() {
-        return ClusterNamespace.getNameFromFullName(fullQualifiedName).equalsIgnoreCase(InfoSchemaDb.DATABASE_NAME);
+        return fullQualifiedName.equalsIgnoreCase(InfoSchemaDb.DATABASE_NAME);
+    }
+
+    // the invoker should hold db's writeLock
+    public void setExist(boolean exist) {
+        this.exist = exist;
+    }
+
+    public List<Table> getHiveTables() {
+        return idToTable.values().stream().filter(Table::isHiveTable).collect(Collectors.toList());
     }
 }

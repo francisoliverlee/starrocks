@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Partition.java
 
@@ -21,6 +34,7 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -32,8 +46,8 @@ import com.starrocks.common.FeConstants;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.common.util.Util;
 import com.starrocks.meta.MetaContext;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -51,7 +65,6 @@ public class Partition extends MetaObject implements Writable {
     private static final Logger LOG = LogManager.getLogger(Partition.class);
 
     public static final long PARTITION_INIT_VERSION = 1L;
-    public static final long PARTITION_INIT_VERSION_HASH = 0L;
 
     public enum PartitionState {
         NORMAL,
@@ -86,30 +99,30 @@ public class Partition extends MetaObject implements Writable {
     /**
      * committed version(hash): after txn is committed, set committed version(hash)
      * visible version(hash): after txn is published, set visible version
-     * next version(hash): next version is set after finished committing, it should equals to committed version + 1
+     * next version(hash): next version is set after finished committing, it should equal to committed version + 1
      */
 
     // not have committedVersion because committedVersion = nextVersion - 1
-    @SerializedName(value = "committedVersionHash")
-    private long committedVersionHash;
     @SerializedName(value = "visibleVersion")
     private long visibleVersion;
     @SerializedName(value = "visibleVersionTime")
     private long visibleVersionTime;
-    @SerializedName(value = "visibleVersionHash")
-    private long visibleVersionHash;
     @SerializedName(value = "nextVersion")
     private long nextVersion;
-    @SerializedName(value = "nextVersionHash")
-    private long nextVersionHash;
     @SerializedName(value = "distributionInfo")
     private DistributionInfo distributionInfo;
+
+    @SerializedName(value = "shardGroupId")
+    private long shardGroupId;
 
     private Partition() {
     }
 
+
+
     public Partition(long id, String name,
-                     MaterializedIndex baseIndex, DistributionInfo distributionInfo) {
+                     MaterializedIndex baseIndex,
+                     DistributionInfo distributionInfo) {
         this.id = id;
         this.name = name;
         this.state = PartitionState.NORMAL;
@@ -118,13 +131,17 @@ public class Partition extends MetaObject implements Writable {
 
         this.visibleVersion = PARTITION_INIT_VERSION;
         this.visibleVersionTime = System.currentTimeMillis();
-        this.visibleVersionHash = PARTITION_INIT_VERSION_HASH;
         // PARTITION_INIT_VERSION == 1, so the first load version is 2 !!!
         this.nextVersion = PARTITION_INIT_VERSION + 1;
-        this.nextVersionHash = Util.generateVersionHash();
-        this.committedVersionHash = PARTITION_INIT_VERSION_HASH;
 
         this.distributionInfo = distributionInfo;
+    }
+
+    public Partition(long id, String name,
+                     MaterializedIndex baseIndex,
+                     DistributionInfo distributionInfo, long shardGroupId) {
+        this(id, name, baseIndex, distributionInfo);
+        this.shardGroupId = shardGroupId;
     }
 
     public void setIdForRestore(long id) {
@@ -133,6 +150,10 @@ public class Partition extends MetaObject implements Writable {
 
     public long getId() {
         return this.id;
+    }
+
+    public long getShardGroupId() {
+        return this.shardGroupId;
     }
 
     public void setName(String newName) {
@@ -151,35 +172,28 @@ public class Partition extends MetaObject implements Writable {
      * If a partition is overwritten by a restore job, we need to reset all version info to
      * the restored partition version info)
      */
-    public void updateVersionForRestore(long visibleVersion, long visibleVersionHash) {
-        this.setVisibleVersion(visibleVersion, visibleVersionHash);
+    public void updateVersionForRestore(long visibleVersion) {
+        this.setVisibleVersion(visibleVersion);
         this.nextVersion = this.visibleVersion + 1;
-        this.nextVersionHash = Util.generateVersionHash();
-        this.committedVersionHash = visibleVersionHash;
-        LOG.info("update partition {} version for restore: visible: {}-{}, next: {}-{}",
-                name, visibleVersion, visibleVersionHash, nextVersion, nextVersionHash);
+        LOG.info("update partition {} version for restore: visible: {}, next: {}",
+                name, visibleVersion, nextVersion);
     }
 
-    public void updateVisibleVersionAndVersionHash(long visibleVersion, long visibleVersionHash) {
-        updateVisibleVersionAndVersionHash(visibleVersion, System.currentTimeMillis(), visibleVersionHash);
+    public void updateVisibleVersion(long visibleVersion) {
+        updateVisibleVersion(visibleVersion, System.currentTimeMillis());
     }
 
-    public void updateVisibleVersionAndVersionHash(long visibleVersion, long visibleVersionTime,
-                                                   long visibleVersionHash) {
-        this.setVisibleVersion(visibleVersion, visibleVersionTime, visibleVersionHash);
+    public void updateVisibleVersion(long visibleVersion, long visibleVersionTime) {
+        this.setVisibleVersion(visibleVersion, visibleVersionTime);
         if (MetaContext.get() != null) {
             // MetaContext is not null means we are in a edit log replay thread.
             // if it is upgrade from old StarRocks cluster, then should update next version info
-            if (Catalog.getCurrentCatalogJournalVersion() < FeMetaVersion.VERSION_45) {
+            if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_45) {
                 // the partition is created and not import any data
-                if (visibleVersion == PARTITION_INIT_VERSION + 1 && visibleVersionHash == PARTITION_INIT_VERSION_HASH) {
+                if (visibleVersion == PARTITION_INIT_VERSION + 1) {
                     this.nextVersion = PARTITION_INIT_VERSION + 1;
-                    this.nextVersionHash = Util.generateVersionHash();
-                    this.committedVersionHash = PARTITION_INIT_VERSION_HASH;
                 } else {
                     this.nextVersion = visibleVersion + 1;
-                    this.nextVersionHash = Util.generateVersionHash();
-                    this.committedVersionHash = visibleVersionHash;
                 }
             }
         }
@@ -193,22 +207,17 @@ public class Partition extends MetaObject implements Writable {
         return visibleVersionTime;
     }
 
-    public long getVisibleVersionHash() {
-        return visibleVersionHash;
-    }
-
-    // The method updateVisibleVersionAndVersionHash is called when fe restart, the visibleVersionTime is updated
-    private void setVisibleVersion(long visibleVersion, long visibleVersionHash) {
+    // The method updateVisibleVersion is called when fe restart, the visibleVersionTime is updated
+    private void setVisibleVersion(long visibleVersion) {
         this.visibleVersion = visibleVersion;
         this.visibleVersionTime = System.currentTimeMillis();
-        this.visibleVersionHash = visibleVersionHash;
     }
 
-    public void setVisibleVersion(long visibleVersion, long visibleVersionTime, long visibleVersionHash) {
+    public void setVisibleVersion(long visibleVersion, long visibleVersionTime) {
         this.visibleVersion = visibleVersion;
         this.visibleVersionTime = visibleVersionTime;
-        this.visibleVersionHash = visibleVersionHash;
     }
+
 
     public PartitionState getState() {
         return this.state;
@@ -234,6 +243,10 @@ public class Partition extends MetaObject implements Writable {
         }
     }
 
+    public void setBaseIndex(MaterializedIndex baseIndex) {
+        this.baseIndex = baseIndex;
+    }
+
     public MaterializedIndex getBaseIndex() {
         return baseIndex;
     }
@@ -246,21 +259,8 @@ public class Partition extends MetaObject implements Writable {
         this.nextVersion = nextVersion;
     }
 
-    public long getNextVersionHash() {
-        return nextVersionHash;
-    }
-
-    public void setNextVersionHash(long nextVersionHash, long committedVersionHash) {
-        this.nextVersionHash = nextVersionHash;
-        this.committedVersionHash = committedVersionHash;
-    }
-
     public long getCommittedVersion() {
         return this.nextVersion - 1;
-    }
-
-    public long getCommittedVersionHash() {
-        return committedVersionHash;
     }
 
     public MaterializedIndex getIndex(long indexId) {
@@ -294,12 +294,37 @@ public class Partition extends MetaObject implements Writable {
         return indices;
     }
 
+    public int getMaterializedIndicesCount(IndexExtState extState) {
+        switch (extState) {
+            case ALL:
+                return 1 + idToVisibleRollupIndex.size() + idToShadowIndex.size();
+            case VISIBLE:
+                return 1 + idToVisibleRollupIndex.size();
+            case SHADOW:
+                return idToVisibleRollupIndex.size();
+            default:
+                return 0;
+        }
+    }
+
+    public int getVisibleMaterializedIndicesCount() {
+        return getMaterializedIndicesCount(IndexExtState.VISIBLE);
+    }
+
     public long getDataSize() {
         long dataSize = 0;
         for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
             dataSize += mIndex.getDataSize();
         }
         return dataSize;
+    }
+
+    public long getRowCount() {
+        long rowCount = 0;
+        for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
+            rowCount += mIndex.getRowCount();
+        }
+        return rowCount;
     }
 
     public long getReplicaCount() {
@@ -319,7 +344,6 @@ public class Partition extends MetaObject implements Writable {
         // So if set FeConstants.runningUnitTest, we can ensure that the number of partitions is not empty,
         // And the test case can continue to execute the logic of 'select best roll up'
         return ((visibleVersion != PARTITION_INIT_VERSION)
-                || (visibleVersionHash != PARTITION_INIT_VERSION_HASH)
                 || FeConstants.runningUnitTest);
     }
 
@@ -374,11 +398,11 @@ public class Partition extends MetaObject implements Writable {
 
         out.writeLong(visibleVersion);
         out.writeLong(visibleVersionTime);
-        out.writeLong(visibleVersionHash);
+        out.writeLong(0); // write a version_hash for compatibility
 
         out.writeLong(nextVersion);
-        out.writeLong(nextVersionHash);
-        out.writeLong(committedVersionHash);
+        out.writeLong(0); // write a version_hash for compatibility
+        out.writeLong(0); // write a version_hash for compatibility
 
         Text.writeString(out, distributionInfo.getType().name());
         distributionInfo.write(out);
@@ -400,7 +424,7 @@ public class Partition extends MetaObject implements Writable {
             idToVisibleRollupIndex.put(rollupTable.getId(), rollupTable);
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_61) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_61) {
             int shadowIndexCount = in.readInt();
             for (int i = 0; i < shadowIndexCount; i++) {
                 MaterializedIndex shadowIndex = MaterializedIndex.read(in);
@@ -409,26 +433,22 @@ public class Partition extends MetaObject implements Writable {
         }
 
         visibleVersion = in.readLong();
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_88) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_88) {
             visibleVersionTime = in.readLong();
         } else {
             visibleVersionTime = System.currentTimeMillis();
         }
-        visibleVersionHash = in.readLong();
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_45) {
+        in.readLong(); // read a version_hash for compatibility
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_45) {
             nextVersion = in.readLong();
-            nextVersionHash = in.readLong();
-            committedVersionHash = in.readLong();
+            in.readLong(); // read a version_hash for compatibility
+            in.readLong(); // read a version_hash for compatibility
         } else {
             // the partition is created and not import any data
-            if (visibleVersion == PARTITION_INIT_VERSION + 1 && visibleVersionHash == PARTITION_INIT_VERSION_HASH) {
+            if (visibleVersion == PARTITION_INIT_VERSION + 1) {
                 this.nextVersion = PARTITION_INIT_VERSION + 1;
-                this.nextVersionHash = Util.generateVersionHash();
-                this.committedVersionHash = PARTITION_INIT_VERSION_HASH;
             } else {
                 this.nextVersion = visibleVersion + 1;
-                this.nextVersionHash = Util.generateVersionHash();
-                this.committedVersionHash = visibleVersionHash;
             }
         }
         DistributionInfoType distriType = DistributionInfoType.valueOf(Text.readString(in));
@@ -439,6 +459,11 @@ public class Partition extends MetaObject implements Writable {
         } else {
             throw new IOException("invalid distribution type: " + distriType);
         }
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(visibleVersion, baseIndex, distributionInfo);
     }
 
     @Override
@@ -467,9 +492,8 @@ public class Partition extends MetaObject implements Writable {
         }
 
         return (visibleVersion == partition.visibleVersion)
-                && (visibleVersionHash == partition.visibleVersionHash)
                 && (baseIndex.equals(partition.baseIndex)
-                && distributionInfo.eqauls(partition.distributionInfo));
+                && distributionInfo.equals(partition.distributionInfo));
     }
 
     @Override
@@ -491,7 +515,7 @@ public class Partition extends MetaObject implements Writable {
         }
 
         buffer.append("committedVersion: ").append(visibleVersion).append("; ");
-        buffer.append("committedVersionHash: ").append(visibleVersionHash).append("; ");
+        buffer.append("committedVersionHash: ").append(0).append("; ");
 
         buffer.append("distribution_info.type: ").append(distributionInfo.getType().name()).append("; ");
         buffer.append("distribution_info: ").append(distributionInfo.toString());

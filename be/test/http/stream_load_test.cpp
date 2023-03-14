@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/http/stream_load_test.cpp
 
@@ -26,14 +39,13 @@
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
-#include "exec/schema_scanner/schema_helper.h"
+#include "gen_cpp/FrontendService_types.h"
 #include "gen_cpp/HeartbeatService_types.h"
 #include "http/http_channel.h"
 #include "http/http_request.h"
 #include "runtime/exec_env.h"
 #include "runtime/stream_load/load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_executor.h"
-#include "runtime/thread_resource_mgr.h"
 #include "util/brpc_stub_cache.h"
 #include "util/cpu_info.h"
 
@@ -41,20 +53,14 @@ class mg_connection;
 
 namespace starrocks {
 
+extern void (*s_injected_send_reply)(HttpRequest*, HttpStatus, const std::string&);
+
+namespace {
 static std::string k_response_str;
-
-// Send Unauthorized status with basic challenge
-void HttpChannel::send_basic_challenge(HttpRequest* req, const std::string& realm) {}
-
-void HttpChannel::send_error(HttpRequest* request, HttpStatus status) {}
-
-void HttpChannel::send_reply(HttpRequest* request, HttpStatus status) {}
-
-void HttpChannel::send_reply(HttpRequest* request, HttpStatus status, const std::string& content) {
+static void inject_send_reply(HttpRequest* request, HttpStatus status, const std::string& content) {
     k_response_str = content;
 }
-
-void HttpChannel::send_file(HttpRequest* request, int fd, size_t off, size_t size) {}
+} // namespace
 
 extern TLoadTxnBeginResult k_stream_load_begin_result;
 extern TLoadTxnCommitResult k_stream_load_commit_result;
@@ -64,8 +70,11 @@ extern Status k_stream_load_plan_status;
 
 class StreamLoadActionTest : public testing::Test {
 public:
-    StreamLoadActionTest() {}
-    virtual ~StreamLoadActionTest() {}
+    StreamLoadActionTest() = default;
+    ~StreamLoadActionTest() override = default;
+    static void SetUpTestSuite() { s_injected_send_reply = inject_send_reply; }
+    static void TearDownTestSuite() { s_injected_send_reply = nullptr; }
+
     void SetUp() override {
         k_stream_load_begin_result = TLoadTxnBeginResult();
         k_stream_load_commit_result = TLoadTxnCommitResult();
@@ -75,8 +84,6 @@ public:
         k_response_str = "";
         config::streaming_load_max_mb = 1;
 
-        _env._thread_mgr = new ThreadResourceMgr();
-        _env._master_info = new TMasterInfo();
         _env._load_stream_mgr = new LoadStreamMgr();
         _env._brpc_stub_cache = new BrpcStubCache();
         _env._stream_load_executor = new StreamLoadExecutor(&_env);
@@ -88,10 +95,6 @@ public:
         _env._brpc_stub_cache = nullptr;
         delete _env._load_stream_mgr;
         _env._load_stream_mgr = nullptr;
-        delete _env._master_info;
-        _env._master_info = nullptr;
-        delete _env._thread_mgr;
-        _env._thread_mgr = nullptr;
         delete _env._stream_load_executor;
         _env._stream_load_executor = nullptr;
 

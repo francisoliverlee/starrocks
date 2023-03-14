@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/exec_env.cpp
 
@@ -21,53 +34,66 @@
 
 #include "runtime/exec_env.h"
 
+#include <memory>
 #include <thread>
 
+#include "agent/agent_server.h"
+#include "agent/master_info.h"
+#include "column/column_pool.h"
 #include "common/config.h"
+#include "common/configbase.h"
 #include "common/logging.h"
+#include "exec/pipeline/driver_limiter.h"
+#include "exec/pipeline/pipeline_driver_executor.h"
+#include "exec/pipeline/query_context.h"
+#include "exec/spill/query_spill_manager.h"
+#include "exec/workgroup/scan_executor.h"
+#include "exec/workgroup/work_group.h"
+#include "exec/workgroup/work_group_fwd.h"
 #include "gen_cpp/BackendService.h"
-#include "gen_cpp/FrontendService.h"
-#include "gen_cpp/HeartbeatService_types.h"
 #include "gen_cpp/TFileBrokerService.h"
-#include "plugin/plugin_mgr.h"
+#include "gutil/strings/substitute.h"
 #include "runtime/broker_mgr.h"
-#include "runtime/bufferpool/buffer_pool.h"
-#include "runtime/bufferpool/reservation_tracker.h"
 #include "runtime/client_cache.h"
 #include "runtime/data_stream_mgr.h"
-#include "runtime/disk_io_mgr.h"
 #include "runtime/external_scan_context_mgr.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/heartbeat_flags.h"
 #include "runtime/load_channel_mgr.h"
 #include "runtime/load_path_mgr.h"
 #include "runtime/mem_tracker.h"
+#include "runtime/memory/mem_chunk_allocator.h"
+#include "runtime/profile_report_worker.h"
 #include "runtime/result_buffer_mgr.h"
 #include "runtime/result_queue_mgr.h"
 #include "runtime/routine_load/routine_load_task_executor.h"
+#include "runtime/runtime_filter_cache.h"
 #include "runtime/runtime_filter_worker.h"
 #include "runtime/small_file_mgr.h"
 #include "runtime/stream_load/load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_executor.h"
-#include "runtime/thread_resource_mgr.h"
-#include "runtime/tmp_file_mgr.h"
+#include "runtime/stream_load/transaction_mgr.h"
+#include "storage/lake/fixed_location_provider.h"
+#include "storage/lake/starlet_location_provider.h"
+#include "storage/lake/tablet_manager.h"
+#include "storage/lake/update_manager.h"
 #include "storage/page_cache.h"
 #include "storage/storage_engine.h"
+#include "storage/tablet_schema_map.h"
 #include "storage/update_manager.h"
 #include "util/bfd_parser.h"
 #include "util/brpc_stub_cache.h"
-#include "util/debug_util.h"
+#include "util/cpu_info.h"
 #include "util/mem_info.h"
-#include "util/metrics.h"
-#include "util/network_util.h"
 #include "util/parse_util.h"
 #include "util/pretty_printer.h"
 #include "util/priority_thread_pool.hpp"
 #include "util/starrocks_metrics.h"
+
 namespace starrocks {
 
 // Calculate the total memory limit of all load tasks on this BE
-static int64_t calc_process_max_load_memory(int64_t process_mem_limit) {
+static int64_t calc_max_load_memory(int64_t process_mem_limit) {
     if (process_mem_limit == -1) {
         // no limit
         return -1;
@@ -77,8 +103,51 @@ static int64_t calc_process_max_load_memory(int64_t process_mem_limit) {
     return std::min<int64_t>(max_load_memory_bytes, config::load_process_max_memory_limit_bytes);
 }
 
+static int64_t calc_max_compaction_memory(int64_t process_mem_limit) {
+    int64_t limit = config::compaction_max_memory_limit;
+    int64_t percent = config::compaction_max_memory_limit_percent;
+
+    if (config::compaction_memory_limit_per_worker < 0) {
+        config::compaction_memory_limit_per_worker = 2147483648; // 2G
+    }
+
+    if (process_mem_limit < 0) {
+        return -1;
+    }
+    if (limit < 0) {
+        limit = process_mem_limit;
+    }
+    if (percent < 0 || percent > 100) {
+        percent = 100;
+    }
+    return std::min<int64_t>(limit, process_mem_limit * percent / 100);
+}
+
+static int64_t calc_max_consistency_memory(int64_t process_mem_limit) {
+    int64_t limit = ParseUtil::parse_mem_spec(config::consistency_max_memory_limit, process_mem_limit);
+    int64_t percent = config::consistency_max_memory_limit_percent;
+
+    if (process_mem_limit < 0) {
+        return -1;
+    }
+    if (limit < 0) {
+        limit = process_mem_limit;
+    }
+    if (percent < 0 || percent > 100) {
+        percent = 100;
+    }
+    return std::min<int64_t>(limit, process_mem_limit * percent / 100);
+}
+
+bool ExecEnv::_is_init = false;
+
 Status ExecEnv::init(ExecEnv* env, const std::vector<StorePath>& store_paths) {
+    DeferOp op([]() { ExecEnv::_is_init = true; });
     return env->_init(store_paths);
+}
+
+bool ExecEnv::is_init() {
+    return _is_init;
 }
 
 Status ExecEnv::_init(const std::vector<StorePath>& store_paths) {
@@ -91,68 +160,226 @@ Status ExecEnv::_init(const std::vector<StorePath>& store_paths) {
     _backend_client_cache = new BackendServiceClientCache(config::max_client_cache_size_per_host);
     _frontend_client_cache = new FrontendServiceClientCache(config::max_client_cache_size_per_host);
     _broker_client_cache = new BrokerServiceClientCache(config::max_client_cache_size_per_host);
-    _thread_mgr = new ThreadResourceMgr();
-    _thread_pool = new PriorityThreadPool(config::doris_scanner_thread_pool_thread_num,
-                                          config::doris_scanner_thread_pool_queue_size);
-    _pipeline_io_thread_pool = new PriorityThreadPool(4, config::doris_scanner_thread_pool_queue_size);
-    _num_scan_operators = 0;
-    _etl_thread_pool = new PriorityThreadPool(config::etl_thread_pool_size, config::etl_thread_pool_queue_size);
+    // query_context_mgr keeps slotted map with 64 slot to reduce contention
+    _query_context_mgr = new pipeline::QueryContextManager(6);
+    RETURN_IF_ERROR(_query_context_mgr->init());
+    _thread_pool =
+            new PriorityThreadPool("table_scan_io", // olap/external table scan thread pool
+                                   config::scanner_thread_pool_thread_num, config::scanner_thread_pool_queue_size);
+
+    _udf_call_pool = new PriorityThreadPool("udf", config::udf_thread_pool_size, config::udf_thread_pool_size);
     _fragment_mgr = new FragmentMgr(this);
 
-    std::unique_ptr<ThreadPool> driver_dispatcher_thread_pool;
-    // auto thread_num_max = std::thread::hardware_concurrency();
-    auto max_thread_num = 3;
-    RETURN_IF_ERROR(ThreadPoolBuilder("driver_dispatcher_thread_pool")
+    RETURN_IF_ERROR(ThreadPoolBuilder("automatic_partition") // automatic partition pool
                             .set_min_threads(0)
-                            .set_max_threads(max_thread_num)
+                            .set_max_threads(8)
                             .set_max_queue_size(1000)
                             .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
-                            .build(&driver_dispatcher_thread_pool));
-    _driver_dispatcher = new pipeline::GlobalDriverDispatcher(std::move(driver_dispatcher_thread_pool));
-    _driver_dispatcher->initialize(max_thread_num);
+                            .build(&_automatic_partition_pool));
 
-    _master_info = new TMasterInfo();
+    int num_prepare_threads = config::pipeline_prepare_thread_pool_thread_num;
+    if (num_prepare_threads <= 0) {
+        num_prepare_threads = CpuInfo::num_cores();
+    }
+    _pipeline_prepare_pool =
+            new PriorityThreadPool("pip_prepare", num_prepare_threads, config::pipeline_prepare_thread_pool_queue_size);
+
+    int num_sink_io_threads = config::pipeline_sink_io_thread_pool_thread_num;
+    if (num_sink_io_threads <= 0) {
+        num_sink_io_threads = CpuInfo::num_cores();
+    }
+    if (config::pipeline_sink_io_thread_pool_queue_size <= 0) {
+        return Status::InvalidArgument("pipeline_sink_io_thread_pool_queue_size shoule be greater than 0");
+    }
+    _pipeline_sink_io_pool =
+            new PriorityThreadPool("pip_sink_io", num_sink_io_threads, config::pipeline_sink_io_thread_pool_queue_size);
+
+    int query_rpc_threads = config::internal_service_query_rpc_thread_num;
+    if (query_rpc_threads <= 0) {
+        query_rpc_threads = CpuInfo::num_cores();
+    }
+    _query_rpc_pool = new PriorityThreadPool("query_rpc", query_rpc_threads, std::numeric_limits<uint32_t>::max());
+
+    std::unique_ptr<ThreadPool> driver_executor_thread_pool;
+    _max_executor_threads = CpuInfo::num_cores();
+    if (config::pipeline_exec_thread_pool_thread_num > 0) {
+        _max_executor_threads = config::pipeline_exec_thread_pool_thread_num;
+    }
+    _max_executor_threads = std::max<int64_t>(1, _max_executor_threads);
+    LOG(INFO) << strings::Substitute("[PIPELINE] Exec thread pool: thread_num=$0", _max_executor_threads);
+    RETURN_IF_ERROR(ThreadPoolBuilder("pip_executor") // pipeline executor
+                            .set_min_threads(0)
+                            .set_max_threads(_max_executor_threads)
+                            .set_max_queue_size(1000)
+                            .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
+                            .build(&driver_executor_thread_pool));
+    _driver_executor = new pipeline::GlobalDriverExecutor("pip_exe", std::move(driver_executor_thread_pool), false);
+    _driver_executor->initialize(_max_executor_threads);
+
+    _driver_limiter =
+            new pipeline::DriverLimiter(_max_executor_threads * config::pipeline_max_num_drivers_per_exec_thread);
+
+    std::unique_ptr<ThreadPool> wg_driver_executor_thread_pool;
+    RETURN_IF_ERROR(ThreadPoolBuilder("pip_wg_executor") // pipeline executor for workgroup
+                            .set_min_threads(0)
+                            .set_max_threads(_max_executor_threads)
+                            .set_max_queue_size(1000)
+                            .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
+                            .build(&wg_driver_executor_thread_pool));
+    _wg_driver_executor =
+            new pipeline::GlobalDriverExecutor("wg_pip_exe", std::move(wg_driver_executor_thread_pool), true);
+    _wg_driver_executor->initialize(_max_executor_threads);
+
+    int connector_num_io_threads =
+            config::pipeline_connector_scan_thread_num_per_cpu * std::thread::hardware_concurrency();
+    CHECK_GT(connector_num_io_threads, 0) << "pipeline_connector_scan_thread_num_per_cpu should greater than 0";
+
+    std::unique_ptr<ThreadPool> connector_scan_worker_thread_pool_without_workgroup;
+    RETURN_IF_ERROR(ThreadPoolBuilder("con_scan_io")
+                            .set_min_threads(0)
+                            .set_max_threads(connector_num_io_threads)
+                            .set_max_queue_size(1000)
+                            .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
+                            .build(&connector_scan_worker_thread_pool_without_workgroup));
+    _connector_scan_executor_without_workgroup = new workgroup::ScanExecutor(
+            std::move(connector_scan_worker_thread_pool_without_workgroup), workgroup::create_scan_task_queue());
+    _connector_scan_executor_without_workgroup->initialize(connector_num_io_threads);
+
+    std::unique_ptr<ThreadPool> connector_scan_worker_thread_pool_with_workgroup;
+    RETURN_IF_ERROR(ThreadPoolBuilder("con_wg_scan_io")
+                            .set_min_threads(0)
+                            .set_max_threads(connector_num_io_threads)
+                            .set_max_queue_size(1000)
+                            .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
+                            .build(&connector_scan_worker_thread_pool_with_workgroup));
+    _connector_scan_executor_with_workgroup =
+            new workgroup::ScanExecutor(std::move(connector_scan_worker_thread_pool_with_workgroup),
+                                        std::make_unique<workgroup::WorkGroupScanTaskQueue>(
+                                                workgroup::WorkGroupScanTaskQueue::SchedEntityType::CONNECTOR));
+    _connector_scan_executor_with_workgroup->initialize(connector_num_io_threads);
+
+    starrocks::workgroup::DefaultWorkGroupInitialization default_workgroup_init;
+
     _load_path_mgr = new LoadPathMgr(this);
-    _disk_io_mgr = new DiskIoMgr();
-    _tmp_file_mgr = new TmpFileMgr(this), _bfd_parser = BfdParser::create();
     _broker_mgr = new BrokerMgr(this);
+    _bfd_parser = BfdParser::create();
     _load_channel_mgr = new LoadChannelMgr();
     _load_stream_mgr = new LoadStreamMgr();
     _brpc_stub_cache = new BrpcStubCache();
     _stream_load_executor = new StreamLoadExecutor(this);
+    _stream_context_mgr = new StreamContextMgr();
+    _transaction_mgr = new TransactionMgr(this);
     _routine_load_task_executor = new RoutineLoadTaskExecutor(this);
     _small_file_mgr = new SmallFileMgr(this, config::small_file_dir);
-    _plugin_mgr = new PluginMgr();
     _runtime_filter_worker = new RuntimeFilterWorker(this);
+    _runtime_filter_cache = new RuntimeFilterCache(8);
+    RETURN_IF_ERROR(_runtime_filter_cache->init());
+    _profile_report_worker = new ProfileReportWorker(this);
 
     _backend_client_cache->init_metrics(StarRocksMetrics::instance()->metrics(), "backend");
     _frontend_client_cache->init_metrics(StarRocksMetrics::instance()->metrics(), "frontend");
     _broker_client_cache->init_metrics(StarRocksMetrics::instance()->metrics(), "broker");
     _result_mgr->init();
-    Status status = _load_path_mgr->init();
-    if (!status.ok()) {
-        LOG(ERROR) << "load path mgr init failed." << status.get_error_msg();
-        exit(-1);
+
+    int num_io_threads = config::pipeline_scan_thread_pool_thread_num <= 0
+                                 ? CpuInfo::num_cores()
+                                 : config::pipeline_scan_thread_pool_thread_num;
+
+    std::unique_ptr<ThreadPool> scan_worker_thread_pool_without_workgroup;
+    RETURN_IF_ERROR(ThreadPoolBuilder("pip_scan_io")
+                            .set_min_threads(0)
+                            .set_max_threads(num_io_threads)
+                            .set_max_queue_size(1000)
+                            .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
+                            .build(&scan_worker_thread_pool_without_workgroup));
+    _scan_executor_without_workgroup = new workgroup::ScanExecutor(std::move(scan_worker_thread_pool_without_workgroup),
+                                                                   workgroup::create_scan_task_queue());
+    _scan_executor_without_workgroup->initialize(num_io_threads);
+
+    std::unique_ptr<ThreadPool> scan_worker_thread_pool_with_workgroup;
+    RETURN_IF_ERROR(ThreadPoolBuilder("pip_wg_scan_io")
+                            .set_min_threads(0)
+                            .set_max_threads(num_io_threads)
+                            .set_max_queue_size(1000)
+                            .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
+                            .build(&scan_worker_thread_pool_with_workgroup));
+    _scan_executor_with_workgroup =
+            new workgroup::ScanExecutor(std::move(scan_worker_thread_pool_with_workgroup),
+                                        std::make_unique<workgroup::WorkGroupScanTaskQueue>(
+                                                workgroup::WorkGroupScanTaskQueue::SchedEntityType::OLAP));
+    _scan_executor_with_workgroup->initialize(num_io_threads);
+
+    // it means acting as compute node while store_path is empty. some threads are not needed for that case.
+    bool is_compute_node = store_paths.empty();
+    if (!is_compute_node) {
+        Status status = _load_path_mgr->init();
+        if (!status.ok()) {
+            LOG(ERROR) << "load path mgr init failed." << status.get_error_msg();
+            exit(-1);
+        }
+#if defined(USE_STAROS) && !defined(BE_TEST)
+        _lake_location_provider = new lake::StarletLocationProvider();
+        _lake_update_manager = new lake::UpdateManager(_lake_location_provider, update_mem_tracker());
+        _lake_tablet_manager = new lake::TabletManager(_lake_location_provider, _lake_update_manager,
+                                                       config::lake_metadata_cache_limit);
+#elif defined(BE_TEST)
+        _lake_location_provider = new lake::FixedLocationProvider(_store_paths.front().path);
+        _lake_update_manager = new lake::UpdateManager(_lake_location_provider, update_mem_tracker());
+        _lake_tablet_manager = new lake::TabletManager(_lake_location_provider, _lake_update_manager,
+                                                       config::lake_metadata_cache_limit);
+#endif
+
+#if defined(USE_STAROS) && !defined(BE_TEST)
+        _lake_tablet_manager->start_gc();
+#endif
     }
+
+    _agent_server = new AgentServer(this, is_compute_node);
+    _agent_server->init_or_die();
+
     _broker_mgr->init();
     _small_file_mgr->init();
-    _init_mem_tracker();
 
-    RETURN_IF_ERROR(_load_channel_mgr->init(_load_mem_tracker));
+    RETURN_IF_ERROR(_load_channel_mgr->init(load_mem_tracker()));
+
+    RETURN_IF_ERROR(QuerySpillManager::init());
+
     _heartbeat_flags = new HeartbeatFlags();
+    auto capacity = std::max<size_t>(config::query_cache_capacity, 4L * 1024 * 1024);
+    _cache_mgr = new query_cache::CacheManager(capacity);
     return Status::OK();
 }
 
-const std::string& ExecEnv::token() const {
-    return _master_info->token;
+std::string ExecEnv::token() const {
+    return get_master_token();
 }
+
+void ExecEnv::add_rf_event(const RfTracePoint& pt) {
+    std::string msg =
+            strings::Substitute("$0($1)", pt.msg, pt.network.empty() ? BackendOptions::get_localhost() : pt.network);
+    _runtime_filter_cache->add_rf_event(pt.query_id, pt.filter_id, std::move(msg));
+}
+
+class SetMemTrackerForColumnPool {
+public:
+    SetMemTrackerForColumnPool(std::shared_ptr<MemTracker> mem_tracker) : _mem_tracker(std::move(mem_tracker)) {}
+
+    template <typename Pool>
+    void operator()() {
+        Pool::singleton()->set_mem_tracker(_mem_tracker);
+    }
+
+private:
+    std::shared_ptr<MemTracker> _mem_tracker = nullptr;
+};
 
 Status ExecEnv::init_mem_tracker() {
     int64_t bytes_limit = 0;
-    bool is_percent = false;
     std::stringstream ss;
     // --mem_limit="" means no memory limit
-    bytes_limit = ParseUtil::parse_mem_spec(config::mem_limit, &is_percent);
+    bytes_limit = ParseUtil::parse_mem_spec(config::mem_limit, MemInfo::physical_mem());
+    // use 90% of mem_limit as the soft mem limit of BE
+    bytes_limit = bytes_limit * 0.9;
     if (bytes_limit <= 0) {
         ss << "Failed to parse mem limit from '" + config::mem_limit + "'.";
         return Status::InternalError(ss.str());
@@ -170,122 +397,165 @@ Status ExecEnv::init_mem_tracker() {
         return Status::InternalError(ss.str());
     }
 
-    _mem_tracker = new MemTracker(MemTracker::PROCESS, bytes_limit, "process");
-    _query_pool_mem_tracker = new MemTracker(MemTracker::QUERY_POOL, bytes_limit * 0.9, "query_pool", _mem_tracker);
+    _process_mem_tracker = regist_tracker(MemTracker::PROCESS, bytes_limit, "process");
+    _query_pool_mem_tracker =
+            regist_tracker(MemTracker::QUERY_POOL, bytes_limit * 0.9, "query_pool", this->process_mem_tracker());
 
-    int64_t load_mem_limit = calc_process_max_load_memory(_mem_tracker->limit());
-    _load_mem_tracker = new MemTracker(MemTracker::LOAD, load_mem_limit, "load", _mem_tracker);
-    _tablet_meta_mem_tracker = new MemTracker(-1, "tablet_meta", _mem_tracker);
-    _compaction_mem_tracker = new MemTracker(-1, "compaction", _mem_tracker);
-    _schema_change_mem_tracker = new MemTracker(-1, "schema_change", _mem_tracker);
-    _snapshot_mem_tracker = new MemTracker(-1, "snapshot", _mem_tracker);
-    _column_pool_mem_tracker = new MemTracker(-1, "column_pool", _mem_tracker);
-    _central_column_pool_mem_tracker = new MemTracker(-1, "central_column_pool", _column_pool_mem_tracker);
-    _local_column_pool_mem_tracker = new MemTracker(-1, "local_column_pool", _column_pool_mem_tracker);
-    _page_cache_mem_tracker = new MemTracker(-1, "page_cache", _mem_tracker);
-    _update_mem_tracker = new MemTracker(bytes_limit * 0.6, "update", _mem_tracker);
+    int64_t load_mem_limit = calc_max_load_memory(_process_mem_tracker->limit());
+    _load_mem_tracker = regist_tracker(MemTracker::LOAD, load_mem_limit, "load", process_mem_tracker());
 
+    // Metadata statistics memory statistics do not use new mem statistics framework with hook
+    _metadata_mem_tracker = regist_tracker(-1, "metadata", nullptr);
+
+    _tablet_metadata_mem_tracker = regist_tracker(-1, "tablet_metadata", metadata_mem_tracker());
+    _rowset_metadata_mem_tracker = regist_tracker(-1, "rowset_metadata", metadata_mem_tracker());
+    _segment_metadata_mem_tracker = regist_tracker(-1, "segment_metadata", metadata_mem_tracker());
+    _column_metadata_mem_tracker = regist_tracker(-1, "column_metadata", metadata_mem_tracker());
+
+    _tablet_schema_mem_tracker = regist_tracker(-1, "tablet_schema", tablet_metadata_mem_tracker());
+    _segment_zonemap_mem_tracker = regist_tracker(-1, "segment_zonemap", segment_metadata_mem_tracker());
+    _short_key_index_mem_tracker = regist_tracker(-1, "short_key_index", segment_metadata_mem_tracker());
+    _column_zonemap_index_mem_tracker = regist_tracker(-1, "column_zonemap_index", column_metadata_mem_tracker());
+    _ordinal_index_mem_tracker = regist_tracker(-1, "ordinal_index", column_metadata_mem_tracker());
+    _bitmap_index_mem_tracker = regist_tracker(-1, "bitmap_index", column_metadata_mem_tracker());
+    _bloom_filter_index_mem_tracker = regist_tracker(-1, "bloom_filter_index", column_metadata_mem_tracker());
+
+    int64_t compaction_mem_limit = calc_max_compaction_memory(_process_mem_tracker->limit());
+    _compaction_mem_tracker = regist_tracker(compaction_mem_limit, "compaction", process_mem_tracker());
+    _schema_change_mem_tracker = regist_tracker(-1, "schema_change", process_mem_tracker());
+    _column_pool_mem_tracker = regist_tracker(-1, "column_pool", process_mem_tracker());
+    _page_cache_mem_tracker = regist_tracker(-1, "page_cache", process_mem_tracker());
+    int32_t update_mem_percent = std::max(std::min(100, config::update_memory_limit_percent), 0);
+    _update_mem_tracker = regist_tracker(bytes_limit * update_mem_percent / 100, "update", nullptr);
+    _chunk_allocator_mem_tracker = regist_tracker(-1, "chunk_allocator", process_mem_tracker());
+    _clone_mem_tracker = regist_tracker(-1, "clone", process_mem_tracker());
+    int64_t consistency_mem_limit = calc_max_consistency_memory(process_mem_tracker()->limit());
+    _consistency_mem_tracker = regist_tracker(consistency_mem_limit, "consistency", process_mem_tracker());
+
+    MemChunkAllocator::init_instance(_chunk_allocator_mem_tracker.get(), config::chunk_reserved_bytes_limit);
+
+    SetMemTrackerForColumnPool op(_column_pool_mem_tracker);
+    ForEach<ColumnPoolList>(op);
+    _init_storage_page_cache();
     return Status::OK();
 }
 
-Status ExecEnv::_init_mem_tracker() {
-    // Initialize global memory limit.
-    bool is_percent = false;
-    std::stringstream ss;
-
-    if (!BitUtil::IsPowerOf2(config::min_buffer_size)) {
-        ss << "--min_buffer_size must be a power-of-two: " << config::min_buffer_size;
-        return Status::InternalError(ss.str());
+int64_t ExecEnv::get_storage_page_cache_size() {
+    std::lock_guard<std::mutex> l(*config::get_mstring_conf_lock());
+    int64_t mem_limit = MemInfo::physical_mem();
+    if (process_mem_tracker()->has_limit()) {
+        mem_limit = process_mem_tracker()->limit();
     }
+    return ParseUtil::parse_mem_spec(config::storage_page_cache_limit, mem_limit);
+}
 
-    int64_t buffer_pool_limit = ParseUtil::parse_mem_spec(config::buffer_pool_limit, &is_percent);
-    if (buffer_pool_limit <= 0) {
-        ss << "Invalid --buffer_pool_limit value, must be a percentage or "
-              "positive bytes value or percentage: "
-           << config::buffer_pool_limit;
-        return Status::InternalError(ss.str());
-    }
-    buffer_pool_limit = BitUtil::RoundDown(buffer_pool_limit, config::min_buffer_size);
-
-    int64_t clean_pages_limit = ParseUtil::parse_mem_spec(config::buffer_pool_clean_pages_limit, &is_percent);
-    if (clean_pages_limit <= 0) {
-        ss << "Invalid --buffer_pool_clean_pages_limit value, must be a percentage or "
-              "positive bytes value or percentage: "
-           << config::buffer_pool_clean_pages_limit;
-        return Status::InternalError(ss.str());
-    }
-
-    _init_buffer_pool(config::min_buffer_size, buffer_pool_limit, clean_pages_limit);
-
-    RETURN_IF_ERROR(_disk_io_mgr->init(_mem_tracker));
-    RETURN_IF_ERROR(_tmp_file_mgr->init(StarRocksMetrics::instance()->metrics()));
-
-    int64_t storage_cache_limit = ParseUtil::parse_mem_spec(config::storage_page_cache_limit, &is_percent);
+int64_t ExecEnv::check_storage_page_cache_size(int64_t storage_cache_limit) {
     if (storage_cache_limit > MemInfo::physical_mem()) {
         LOG(WARNING) << "Config storage_page_cache_limit is greater than memory size, config="
                      << config::storage_page_cache_limit << ", memory=" << MemInfo::physical_mem();
     }
-    StoragePageCache::create_global_cache(_page_cache_mem_tracker, storage_cache_limit);
+    if (!config::disable_storage_page_cache) {
+        if (storage_cache_limit < kcacheMinSize) {
+            LOG(WARNING) << "Storage cache limit is too small, use default size.";
+            storage_cache_limit = kcacheMinSize;
+        }
+        LOG(INFO) << "Set storage page cache size " << storage_cache_limit;
+    }
+    return storage_cache_limit;
+}
+
+Status ExecEnv::_init_storage_page_cache() {
+    int64_t storage_cache_limit = get_storage_page_cache_size();
+    storage_cache_limit = check_storage_page_cache_size(storage_cache_limit);
+    StoragePageCache::create_global_cache(page_cache_mem_tracker(), storage_cache_limit);
 
     // TODO(zc): The current memory usage configuration is a bit confusing,
     // we need to sort out the use of memory
     return Status::OK();
 }
 
-void ExecEnv::_init_buffer_pool(int64_t min_page_size, int64_t capacity, int64_t clean_pages_limit) {
-    DCHECK(_buffer_pool == nullptr);
-    _buffer_pool = new BufferPool(min_page_size, capacity, clean_pages_limit);
-    _buffer_reservation = new ReservationTracker();
-    _buffer_reservation->InitRootTracker(nullptr, capacity);
+void ExecEnv::_destroy() {
+    if (_automatic_partition_pool) {
+        _automatic_partition_pool->shutdown();
+    }
+
+    SAFE_DELETE(_agent_server);
+    SAFE_DELETE(_runtime_filter_worker);
+    SAFE_DELETE(_profile_report_worker);
+    SAFE_DELETE(_heartbeat_flags);
+    SAFE_DELETE(_small_file_mgr);
+    SAFE_DELETE(_transaction_mgr);
+    SAFE_DELETE(_stream_context_mgr);
+    SAFE_DELETE(_routine_load_task_executor);
+    SAFE_DELETE(_stream_load_executor);
+    SAFE_DELETE(_brpc_stub_cache);
+    SAFE_DELETE(_load_stream_mgr);
+    SAFE_DELETE(_load_channel_mgr);
+    SAFE_DELETE(_broker_mgr);
+    SAFE_DELETE(_bfd_parser);
+    SAFE_DELETE(_load_path_mgr);
+    SAFE_DELETE(_driver_executor);
+    SAFE_DELETE(_wg_driver_executor);
+    SAFE_DELETE(_fragment_mgr);
+    SAFE_DELETE(_udf_call_pool);
+    SAFE_DELETE(_pipeline_prepare_pool);
+    SAFE_DELETE(_pipeline_sink_io_pool);
+    SAFE_DELETE(_query_rpc_pool);
+    SAFE_DELETE(_scan_executor_without_workgroup);
+    SAFE_DELETE(_scan_executor_with_workgroup);
+    SAFE_DELETE(_connector_scan_executor_without_workgroup);
+    SAFE_DELETE(_connector_scan_executor_with_workgroup);
+    SAFE_DELETE(_thread_pool);
+
+    if (_lake_tablet_manager != nullptr) {
+        _lake_tablet_manager->prune_metacache();
+    }
+
+    // WorkGroupManager should release MemTracker of WorkGroups belongs to itself before deallocate _query_pool_mem_tracker.
+    workgroup::WorkGroupManager::instance()->destroy();
+    SAFE_DELETE(_query_context_mgr);
+    SAFE_DELETE(_runtime_filter_cache);
+    SAFE_DELETE(_driver_limiter);
+    SAFE_DELETE(_broker_client_cache);
+    SAFE_DELETE(_frontend_client_cache);
+    SAFE_DELETE(_backend_client_cache);
+    SAFE_DELETE(_result_queue_mgr);
+    SAFE_DELETE(_result_mgr);
+    SAFE_DELETE(_stream_mgr);
+    SAFE_DELETE(_external_scan_context_mgr);
+    SAFE_DELETE(_lake_tablet_manager);
+    SAFE_DELETE(_lake_location_provider);
+    SAFE_DELETE(_lake_update_manager);
+    SAFE_DELETE(_cache_mgr);
+    _metrics = nullptr;
+
+    _reset_tracker();
 }
 
-void ExecEnv::_destory() {
-    delete _runtime_filter_worker;
-    delete _brpc_stub_cache;
-    delete _load_stream_mgr;
-    delete _load_channel_mgr;
-    delete _broker_mgr;
-    delete _bfd_parser;
-    delete _tmp_file_mgr;
-    delete _disk_io_mgr;
-    delete _load_path_mgr;
-    delete _master_info;
-    delete _driver_dispatcher;
-    delete _fragment_mgr;
-    delete _etl_thread_pool;
-    delete _thread_pool;
-    delete _thread_mgr;
-    delete _update_mem_tracker;
-    delete _page_cache_mem_tracker;
-    delete _local_column_pool_mem_tracker;
-    delete _central_column_pool_mem_tracker;
-    delete _column_pool_mem_tracker;
-    delete _snapshot_mem_tracker;
-    delete _schema_change_mem_tracker;
-    delete _compaction_mem_tracker;
-    delete _tablet_meta_mem_tracker;
-    delete _load_mem_tracker;
-    delete _query_pool_mem_tracker;
-    delete _mem_tracker;
-    delete _broker_client_cache;
-    delete _frontend_client_cache;
-    delete _backend_client_cache;
-    delete _result_mgr;
-    delete _result_queue_mgr;
-    delete _stream_mgr;
-    delete _stream_load_executor;
-    delete _routine_load_task_executor;
-    delete _external_scan_context_mgr;
-    delete _heartbeat_flags;
-    _metrics = nullptr;
+void ExecEnv::_reset_tracker() {
+    for (auto iter = _mem_trackers.rbegin(); iter != _mem_trackers.rend(); ++iter) {
+        iter->reset();
+    }
+}
+
+template <class... Args>
+std::shared_ptr<MemTracker> ExecEnv::regist_tracker(Args&&... args) {
+    auto mem_tracker = std::make_shared<MemTracker>(std::forward<Args>(args)...);
+    _mem_trackers.emplace_back(mem_tracker);
+    return mem_tracker;
 }
 
 void ExecEnv::destroy(ExecEnv* env) {
-    env->_destory();
+    env->_destroy();
 }
 
-void ExecEnv::set_storage_engine(StorageEngine* storage_engine) {
-    _storage_engine = storage_engine;
+int32_t ExecEnv::calc_pipeline_dop(int32_t pipeline_dop) const {
+    if (pipeline_dop > 0) {
+        return pipeline_dop;
+    }
+
+    // Default dop is a half of the number of hardware threads.
+    return std::max<int32_t>(1, _max_executor_threads / 2);
 }
 
 } // namespace starrocks

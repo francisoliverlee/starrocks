@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.base;
 
@@ -9,15 +22,23 @@ import com.starrocks.sql.optimizer.operator.physical.PhysicalDistributionOperato
 
 public class DistributionProperty implements PhysicalProperty {
     private final DistributionSpec spec;
+    private final boolean isCTERequired;
 
     public static final DistributionProperty EMPTY = new DistributionProperty();
 
     public DistributionProperty() {
         this.spec = DistributionSpec.createAnyDistributionSpec();
+        this.isCTERequired = false;
     }
 
     public DistributionProperty(DistributionSpec spec) {
         this.spec = spec;
+        this.isCTERequired = false;
+    }
+
+    public DistributionProperty(DistributionSpec spec, boolean isCTERequired) {
+        this.spec = spec;
+        this.isCTERequired = isCTERequired;
     }
 
     public DistributionSpec getSpec() {
@@ -40,8 +61,18 @@ public class DistributionProperty implements PhysicalProperty {
         return spec.type == DistributionSpec.DistributionType.BROADCAST;
     }
 
+    public boolean isCTERequired() {
+        return isCTERequired;
+    }
+
     @Override
     public boolean isSatisfy(PhysicalProperty other) {
+        if (((DistributionProperty) other).isCTERequired()) {
+            // always satisfy if parent is CTENoOp/CTEAnchor.
+            // the plan will be adjusted in the father of CTENoOp/CTEAnchor, and
+            // the distribution of CTENoOp/CTEAnchor always keep same with children
+            return true;
+        }
         DistributionSpec otherSpec = ((DistributionProperty) other).getSpec();
         return spec.isSatisfy(otherSpec);
     }
@@ -65,6 +96,6 @@ public class DistributionProperty implements PhysicalProperty {
         }
 
         DistributionProperty rhs = (DistributionProperty) obj;
-        return spec.equals(rhs.getSpec());
+        return spec.equals(rhs.getSpec()) && isCTERequired == rhs.isCTERequired;
     }
 }

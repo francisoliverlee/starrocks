@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/transaction/TabletCommitInfo.java
 
@@ -36,10 +49,22 @@ public class TabletCommitInfo implements Writable {
     private long tabletId;
     private long backendId;
 
+    // For low cardinality string column with global dict
+    private List<String> invalidDictCacheColumns = Lists.newArrayList();
+    private List<String> validDictCacheColumns = Lists.newArrayList();
+
     public TabletCommitInfo(long tabletId, long backendId) {
         super();
         this.tabletId = tabletId;
         this.backendId = backendId;
+    }
+
+    public TabletCommitInfo(long tabletId, long backendId, List<String> invalidDictCacheColumns,
+                            List<String> validDictCacheColumns) {
+        this.tabletId = tabletId;
+        this.backendId = backendId;
+        this.invalidDictCacheColumns = invalidDictCacheColumns;
+        this.validDictCacheColumns = validDictCacheColumns;
     }
 
     public long getTabletId() {
@@ -50,10 +75,27 @@ public class TabletCommitInfo implements Writable {
         return backendId;
     }
 
+    public List<String> getInvalidDictCacheColumns() {
+        return invalidDictCacheColumns;
+    }
+
+    public List<String> getValidDictCacheColumns() {
+        return validDictCacheColumns;
+    }
+
     public static List<TabletCommitInfo> fromThrift(List<TTabletCommitInfo> tTabletCommitInfos) {
         List<TabletCommitInfo> commitInfos = Lists.newArrayList();
         for (TTabletCommitInfo tTabletCommitInfo : tTabletCommitInfos) {
-            commitInfos.add(new TabletCommitInfo(tTabletCommitInfo.getTabletId(), tTabletCommitInfo.getBackendId()));
+            if (tTabletCommitInfo.isSetInvalid_dict_cache_columns()) {
+                commitInfos.add(new TabletCommitInfo(tTabletCommitInfo.getTabletId(),
+                        tTabletCommitInfo.getBackendId(),
+                        tTabletCommitInfo.getInvalid_dict_cache_columns(),
+                        tTabletCommitInfo.getValid_dict_cache_columns()));
+            } else {
+                commitInfos.add(new TabletCommitInfo(tTabletCommitInfo.getTabletId(),
+                        tTabletCommitInfo.getBackendId()));
+            }
+
         }
         return commitInfos;
     }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/MetadataViewer.java
 
@@ -23,15 +36,16 @@ package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.AdminShowReplicaDistributionStmt;
-import com.starrocks.analysis.AdminShowReplicaStatusStmt;
 import com.starrocks.analysis.BinaryPredicate.Operator;
-import com.starrocks.analysis.PartitionNames;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.Replica.ReplicaStatus;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AdminShowReplicaDistributionStmt;
+import com.starrocks.sql.ast.AdminShowReplicaStatusStmt;
+import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 
@@ -51,10 +65,10 @@ public class MetadataViewer {
                                                       ReplicaStatus statusFilter, Operator op) throws DdlException {
         List<List<String>> result = Lists.newArrayList();
 
-        Catalog catalog = Catalog.getCurrentCatalog();
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
 
-        Database db = catalog.getDb(dbName);
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exsit");
         }
@@ -90,7 +104,7 @@ public class MetadataViewer {
                     for (Tablet tablet : index.getTablets()) {
                         long tabletId = tablet.getId();
                         int count = replicationNum;
-                        for (Replica replica : tablet.getReplicas()) {
+                        for (Replica replica : ((LocalTablet) tablet).getImmutableReplicas()) {
                             --count;
                             List<String> row = Lists.newArrayList();
 
@@ -117,9 +131,10 @@ public class MetadataViewer {
                             row.add(String.valueOf(replica.getLastFailedVersion()));
                             row.add(String.valueOf(replica.getLastSuccessVersion()));
                             row.add(String.valueOf(visibleVersion));
-                            row.add(String.valueOf(replica.getSchemaHash()));
+                            row.add(String.valueOf(Replica.DEPRECATED_PROP_SCHEMA_HASH));
                             row.add(String.valueOf(replica.getVersionCount()));
                             row.add(String.valueOf(replica.isBad()));
+                            row.add(String.valueOf(replica.isSetBadForce()));
                             row.add(replica.getState().name());
                             row.add(status.name());
                             result.add(row);
@@ -140,8 +155,8 @@ public class MetadataViewer {
                             row.add("-1");
                             row.add("-1");
                             row.add("-1");
-                            row.add(FeConstants.null_string);
-                            row.add(FeConstants.null_string);
+                            row.add(FeConstants.NULL_STRING);
+                            row.add(FeConstants.NULL_STRING);
                             row.add(ReplicaStatus.MISSING.name());
                             result.add(row);
                         }
@@ -177,10 +192,10 @@ public class MetadataViewer {
 
         List<List<String>> result = Lists.newArrayList();
 
-        Catalog catalog = Catalog.getCurrentCatalog();
-        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        SystemInfoService infoService = GlobalStateMgr.getCurrentSystemInfo();
 
-        Database db = catalog.getDb(dbName);
+        Database db = globalStateMgr.getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exsit");
         }
@@ -188,8 +203,8 @@ public class MetadataViewer {
         db.readLock();
         try {
             Table tbl = db.getTable(tblName);
-            if (tbl == null || tbl.getType() != TableType.OLAP) {
-                throw new DdlException("Table does not exist or is not OLAP table: " + tblName);
+            if (tbl == null || !tbl.isNativeTable()) {
+                throw new DdlException("Table does not exist or is not native table: " + tblName);
             }
 
             OlapTable olapTable = (OlapTable) tbl;
@@ -223,11 +238,11 @@ public class MetadataViewer {
                 Partition partition = olapTable.getPartition(partId);
                 for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
                     for (Tablet tablet : index.getTablets()) {
-                        for (Replica replica : tablet.getReplicas()) {
-                            if (!countMap.containsKey(replica.getBackendId())) {
+                        for (long beId : tablet.getBackendIds()) {
+                            if (!countMap.containsKey(beId)) {
                                 continue;
                             }
-                            countMap.put(replica.getBackendId(), countMap.get(replica.getBackendId()) + 1);
+                            countMap.put(beId, countMap.get(beId) + 1);
                             totalReplicaNum++;
                         }
                     }
@@ -254,7 +269,7 @@ public class MetadataViewer {
 
     private static String graph(int num, int totalNum, int mod) {
         StringBuilder sb = new StringBuilder();
-        int normalized = (int) Math.ceil(num * mod / totalNum);
+        int normalized = (int) Math.ceil(num * mod * 1.0 / totalNum);
         for (int i = 0; i < normalized; ++i) {
             sb.append(">");
         }

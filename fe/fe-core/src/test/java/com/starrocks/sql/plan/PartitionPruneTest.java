@@ -1,10 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
+import com.clearspring.analytics.util.Lists;
 import com.starrocks.common.FeConstants;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
+import java.util.List;
 
 import static org.junit.Assert.assertTrue;
 
@@ -76,15 +92,13 @@ public class PartitionPruneTest extends PlanTestBase {
     @Test
     public void testPredicatePrune5() throws Exception {
         String sql = getFragmentPlan("select * from ptest where d2 = '2020-08-01' and d2 < '2020-07-01';");
-        assertTrue(sql.contains("  0:EMPTYSET\n"
-                + "     use vectorized: true"));
+        assertTrue(sql.contains("  0:EMPTYSET\n"));
     }
 
     @Test
     public void testPredicatePrune6() throws Exception {
         String sql = getFragmentPlan("select * from ptest where d2 = '2020-08-01' and d2 = '2020-09-01';");
-        assertTrue(sql.contains("  0:EMPTYSET\n"
-                + "     use vectorized: true"));
+        assertTrue(sql.contains("  0:EMPTYSET\n"));
     }
 
     @Test
@@ -96,5 +110,67 @@ public class PartitionPruneTest extends PlanTestBase {
                 "     PREDICATES: 2: d2 = '2020-07-01'\n" +
                 "     partitions=1/4\n" +
                 "     rollup: ptest"));
+    }
+
+    @Test
+    public void testInClauseCombineOr_1() throws Exception {
+        String plan = getFragmentPlan("select * from ptest where (d2 > '1000-01-01') or (d2 in (null, '2020-01-01'));");
+        assertTrue(plan.contains("  0:OlapScanNode\n" +
+                "     TABLE: ptest\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: (2: d2 > '1000-01-01') OR (2: d2 IN (NULL, '2020-01-01')), 2: d2 > '1000-01-01'\n" +
+                "     partitions=4/4\n" +
+                "     rollup: ptest"));
+    }
+
+    @Test
+    public void testInClauseCombineOr_2() throws Exception {
+        String plan = getFragmentPlan("select * from ptest where (d2 > '1000-01-01') or (d2 in (null, null));");
+        assertTrue(plan.contains("  0:OlapScanNode\n" +
+                "     TABLE: ptest\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: (2: d2 > '1000-01-01') OR (2: d2 IN (NULL, NULL)), 2: d2 > '1000-01-01'\n" +
+                "     partitions=4/4\n" +
+                "     rollup: ptest"));
+    }
+
+    @Test
+    public void testInvalidDatePrune() throws Exception {
+        connectContext.getSessionVariable().setOptimizerExecuteTimeout(300000);
+        List<String> sqls = Lists.newArrayList();
+
+        String plan = "";
+        sqls.add("select * from ptest where d2 in ('1998-01-32', 'abc', 'abc')");
+        sqls.add("select * from ptest where d2 <= '1998-01-32'");
+        for (String sql : sqls) {
+            plan = getFragmentPlan(sql);
+            assertContains(plan, "partitions=0/4");
+        }
+
+        sqls.clear();
+        sqls.add("select * from ptest where d2 in ('abc')");
+        sqls.add("select * from ptest where d2 in ('1998-01-32')");
+        sqls.add("select * from ptest where d2 = '1998-01-32'");
+        sqls.add("select * from ptest where d2 in ('1998-01-01', 'abc', '1998-13-01')");
+        for (String sql : sqls) {
+            plan = getFragmentPlan(sql);
+            assertContains(plan, "partitions=1/4");
+        }
+
+        sqls.clear();
+        sqls.add("select * from ptest where d2 in ('2020-06-01', 'abc', '1998-11-01')");
+        sqls.add("select * from ptest where d2 in ('2020-06-01', 'abc', '1998-11-01', '2001-01-33')");
+        for (String sql : sqls) {
+            plan = getFragmentPlan(sql);
+            assertContains(plan, "partitions=2/4");
+        }
+
+        sqls.clear();
+        sqls.add("select * from ptest where d2 in ('1998-01-32', cast(cast('2021-01-12' as SIGNED) as DATE))");
+        sqls.add("select * from ptest where d2 in ('1998-01-01', cast(cast('2021-01-12' as SIGNED) as DATE))");
+        for (String sql : sqls) {
+            plan = getFragmentPlan(sql);
+            assertContains(plan, "partitions=4/4");
+        }
     }
 }

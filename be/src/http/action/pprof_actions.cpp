@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/http/action/pprof_actions.cpp
 
@@ -20,7 +33,9 @@
 // under the License.
 
 #include "http/action/pprof_actions.h"
-
+#ifdef USE_JEMALLOC
+#include "jemalloc/jemalloc.h"
+#endif
 #include <gperftools/heap-profiler.h>
 #include <gperftools/malloc_extension.h>
 #include <gperftools/profiler.h>
@@ -28,18 +43,15 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
-#include <sstream>
 
 #include "common/config.h"
+#include "common/status.h"
+#include "common/tracer.h"
 #include "http/ev_http_server.h"
 #include "http/http_channel.h"
-#include "http/http_handler.h"
 #include "http/http_headers.h"
 #include "http/http_request.h"
-#include "http/http_response.h"
-#include "runtime/exec_env.h"
 #include "util/bfd_parser.h"
-#include "util/file_utils.h"
 
 namespace starrocks {
 
@@ -50,20 +62,31 @@ static const int kPprofDefaultSampleSecs = 30;
 // Protect, only one thread can work
 static std::mutex kPprofActionMutex;
 
-class HeapAction : public HttpHandler {
-public:
-    HeapAction() {}
-    virtual ~HeapAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-};
-
 void HeapAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     (void)kPprofDefaultSampleSecs; // Avoid unused variable warning.
 
     std::string str = "Heap profiling is not available with address sanitizer builds.";
 
+    HttpChannel::send_reply(req, str);
+#elif defined(USE_JEMALLOC)
+    (void)kPprofDefaultSampleSecs; // Avoid unused variable warning.
+
+    std::lock_guard<std::mutex> lock(kPprofActionMutex);
+    std::string str;
+    std::stringstream tmp_prof_file_name;
+    tmp_prof_file_name << config::pprof_profile_dir << "/heap_profile." << getpid() << "." << rand();
+
+    // NOTE: Use fname to make the content which fname_cstr references to is still valid
+    // when je_mallctl is executing
+    auto fname = tmp_prof_file_name.str();
+    const char* fname_cstr = fname.c_str();
+    if (je_mallctl("prof.dump", nullptr, nullptr, &fname_cstr, sizeof(const char*)) == 0) {
+        std::ifstream f(fname_cstr);
+        str = std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    } else {
+        std::string str = "dump jemalloc prof file failed";
+    }
     HttpChannel::send_reply(req, str);
 #else
     std::lock_guard<std::mutex> lock(kPprofActionMutex);
@@ -90,17 +113,14 @@ void HeapAction::handle(HttpRequest* req) {
 #endif
 }
 
-class GrowthAction : public HttpHandler {
-public:
-    GrowthAction() {}
-    virtual ~GrowthAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-};
-
 void GrowthAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     std::string str = "Growth profiling is not available with address sanitizer builds.";
+    HttpChannel::send_reply(req, str);
+#elif defined(USE_JEMALLOC)
+    std::string str =
+            "Growth profiling is not available with jemalloc builds.You can set the `--base` flag to jeprof to compare "
+            "the results of two Heap Profiling";
     HttpChannel::send_reply(req, str);
 #else
     std::lock_guard<std::mutex> lock(kPprofActionMutex);
@@ -112,20 +132,13 @@ void GrowthAction::handle(HttpRequest* req) {
 #endif
 }
 
-class ProfileAction : public HttpHandler {
-public:
-    ProfileAction() {}
-    virtual ~ProfileAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-};
-
 void ProfileAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     std::string str = "CPU profiling is not available with address sanitizer builds.";
     HttpChannel::send_reply(req, str);
 #else
     std::lock_guard<std::mutex> lock(kPprofActionMutex);
+    auto scoped_span = trace::Scope(Tracer::Instance().start_trace("http_handle_profile"));
 
     int seconds = kPprofDefaultSampleSecs;
     const std::string& seconds_str = req->param(SECOND_KEY);
@@ -155,28 +168,6 @@ void ProfileAction::handle(HttpRequest* req) {
 #endif
 }
 
-class PmuProfileAction : public HttpHandler {
-public:
-    PmuProfileAction() {}
-    virtual ~PmuProfileAction() {}
-    virtual void handle(HttpRequest* req) override {}
-};
-
-class ContentionAction : public HttpHandler {
-public:
-    ContentionAction() {}
-    virtual ~ContentionAction() {}
-
-    virtual void handle(HttpRequest* req) override {}
-};
-
-class CmdlineAction : public HttpHandler {
-public:
-    CmdlineAction() {}
-    virtual ~CmdlineAction() {}
-    virtual void handle(HttpRequest* req) override;
-};
-
 void CmdlineAction::handle(HttpRequest* req) {
     FILE* fp = fopen("/proc/self/cmdline", "r");
     if (fp == nullptr) {
@@ -186,23 +177,14 @@ void CmdlineAction::handle(HttpRequest* req) {
         return;
     }
     char buf[1024];
-    fscanf(fp, "%s ", buf);
+    if (fscanf(fp, "%s ", buf) != 1) {
+        strcpy(buf, "read cmdline failed");
+    }
     fclose(fp);
     std::string str = buf;
 
     HttpChannel::send_reply(req, str);
 }
-
-class SymbolAction : public HttpHandler {
-public:
-    SymbolAction(BfdParser* parser) : _parser(parser) {}
-    virtual ~SymbolAction() {}
-
-    virtual void handle(HttpRequest* req) override;
-
-private:
-    BfdParser* _parser;
-};
 
 void SymbolAction::handle(HttpRequest* req) {
     // TODO: Implement symbol resolution. Without this, the binary needs to be passed
@@ -241,24 +223,6 @@ void SymbolAction::handle(HttpRequest* req) {
 
         HttpChannel::send_reply(req, result);
     }
-}
-
-Status PprofActions::setup(ExecEnv* exec_env, EvHttpServer* http_server) {
-    if (!config::pprof_profile_dir.empty()) {
-        FileUtils::create_dir(config::pprof_profile_dir);
-    }
-
-    http_server->register_handler(HttpMethod::GET, "/pprof/heap", new HeapAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/growth", new GrowthAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/profile", new ProfileAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/pmuprofile", new PmuProfileAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/contention", new ContentionAction());
-    http_server->register_handler(HttpMethod::GET, "/pprof/cmdline", new CmdlineAction());
-    auto action = new SymbolAction(exec_env->bfd_parser());
-    http_server->register_handler(HttpMethod::GET, "/pprof/symbol", action);
-    http_server->register_handler(HttpMethod::HEAD, "/pprof/symbol", action);
-    http_server->register_handler(HttpMethod::POST, "/pprof/symbol", action);
-    return Status::OK();
 }
 
 } // namespace starrocks

@@ -1,42 +1,38 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.statistic;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.catalog.Catalog;
-import com.starrocks.catalog.Database;
-import com.starrocks.catalog.Table;
-import com.starrocks.common.Config;
-import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
-import com.starrocks.statistic.Constants.AnalyzeType;
-import com.starrocks.statistic.Constants.ScheduleStatus;
-import com.starrocks.statistic.Constants.ScheduleType;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.statistic.StatsConstants.AnalyzeType;
+import com.starrocks.statistic.StatsConstants.ScheduleStatus;
+import com.starrocks.statistic.StatsConstants.ScheduleType;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 
 public class AnalyzeJob implements Writable {
-    public static final String PROP_UPDATE_INTERVAL_SEC_KEY = "update_interval_sec";
-    public static final String PROP_EXPIRE_SEC_KEY = "expire_sec";
-    public static final String PROP_SAMPLE_COLLECT_ROWS_KEY = "sample_collect_rows";
-
-    public static final List<String> NUMBER_PROP_KEY_LIST = ImmutableList.<String>builder()
-            .add(PROP_UPDATE_INTERVAL_SEC_KEY)
-            .add(PROP_EXPIRE_SEC_KEY)
-            .add(PROP_SAMPLE_COLLECT_ROWS_KEY).build();
-
-    public static final long DEFAULT_ALL_ID = -1;
 
     @SerializedName("id")
     private long id;
@@ -69,15 +65,17 @@ public class AnalyzeJob implements Writable {
     @SerializedName("reason")
     private String reason;
 
-    public AnalyzeJob() {
-        dbId = DEFAULT_ALL_ID;
-        tableId = DEFAULT_ALL_ID;
-        columns = Lists.newArrayList();
-        type = AnalyzeType.SAMPLE;
-        scheduleType = ScheduleType.ONCE;
-        properties = Maps.newHashMap();
-        status = ScheduleStatus.PENDING;
-        workTime = LocalDateTime.MIN;
+    public AnalyzeJob(long dbId, long tableId, List<String> columns, AnalyzeType type, ScheduleType scheduleType,
+                      Map<String, String> properties, ScheduleStatus status, LocalDateTime workTime) {
+        this.id = -1;
+        this.dbId = dbId;
+        this.tableId = tableId;
+        this.columns = columns;
+        this.type = type;
+        this.scheduleType = scheduleType;
+        this.properties = properties;
+        this.status = status;
+        this.workTime = workTime;
     }
 
     public long getId() {
@@ -92,32 +90,20 @@ public class AnalyzeJob implements Writable {
         return dbId;
     }
 
-    public void setDbId(long dbId) {
-        this.dbId = dbId;
-    }
-
     public long getTableId() {
         return tableId;
-    }
-
-    public void setTableId(long tableId) {
-        this.tableId = tableId;
     }
 
     public List<String> getColumns() {
         return columns;
     }
 
-    public void setColumns(List<String> columns) {
-        this.columns = columns;
-    }
-
-    public AnalyzeType getType() {
+    public AnalyzeType getAnalyzeType() {
         return type;
     }
 
-    public void setType(AnalyzeType type) {
-        this.type = type;
+    public ScheduleType getScheduleType() {
+        return scheduleType;
     }
 
     public LocalDateTime getWorkTime() {
@@ -136,29 +122,6 @@ public class AnalyzeJob implements Writable {
         this.reason = reason;
     }
 
-    public long getUpdateIntervalSec() {
-        return Long.parseLong(properties
-                .getOrDefault(PROP_UPDATE_INTERVAL_SEC_KEY, String.valueOf(Config.statistic_update_interval_sec)));
-    }
-
-    public long getExpireSec() {
-        return Long
-                .parseLong(properties.getOrDefault(PROP_EXPIRE_SEC_KEY, String.valueOf(Config.statistic_expire_sec)));
-    }
-
-    public long getSampleCollectRows() {
-        return Long.parseLong(properties
-                .getOrDefault(PROP_SAMPLE_COLLECT_ROWS_KEY, String.valueOf(Config.statistic_sample_collect_rows)));
-    }
-
-    public ScheduleType getScheduleType() {
-        return scheduleType;
-    }
-
-    public void setScheduleType(ScheduleType scheduleType) {
-        this.scheduleType = scheduleType;
-    }
-
     public ScheduleStatus getStatus() {
         return status;
     }
@@ -167,63 +130,40 @@ public class AnalyzeJob implements Writable {
         this.status = status;
     }
 
-    public void setProperties(Map<String, String> properties) {
-        this.properties = properties;
-    }
-
     public Map<String, String> getProperties() {
         return properties;
     }
 
-    public List<String> showAnalyzeJobs() throws MetaNotFoundException {
-        List<String> row = Lists.newArrayList("", "ALL", "ALL", "ALL", "", "", "", "", "", "");
+    public void run(ConnectContext statsConnectContext, StatisticExecutor statisticExecutor) {
+        setStatus(StatsConstants.ScheduleStatus.RUNNING);
+        GlobalStateMgr.getCurrentAnalyzeMgr().updateAnalyzeJobWithoutLog(this);
+        List<StatisticsCollectJob> statisticsCollectJobList =
+                StatisticsCollectJobFactory.buildStatisticsCollectJob(this);
 
-        row.set(0, String.valueOf(id));
-        if (DEFAULT_ALL_ID != dbId) {
-            Database db = Catalog.getCurrentCatalog().getDb(dbId);
+        boolean hasFailedCollectJob = false;
+        for (StatisticsCollectJob statsJob : statisticsCollectJobList) {
+            AnalyzeStatus analyzeStatus = new AnalyzeStatus(GlobalStateMgr.getCurrentState().getNextId(),
+                    statsJob.getDb().getId(), statsJob.getTable().getId(), statsJob.getColumns(),
+                    statsJob.getType(), statsJob.getScheduleType(), statsJob.getProperties(), LocalDateTime.now());
+            analyzeStatus.setStatus(StatsConstants.ScheduleStatus.FAILED);
+            GlobalStateMgr.getCurrentAnalyzeMgr().addAnalyzeStatus(analyzeStatus);
 
-            if (db == null) {
-                throw new MetaNotFoundException("No found database: " + dbId);
-            }
-
-            row.set(1, db.getFullName());
-
-            if (DEFAULT_ALL_ID != tableId) {
-                Table table = db.getTable(tableId);
-
-                if (table == null) {
-                    throw new MetaNotFoundException("No found table: " + tableId);
-                }
-
-                row.set(2, table.getName());
-
-                if (null != columns && !columns.isEmpty()
-                        && (columns.size() != table.getBaseSchema().size())) {
-                    String str = String.join(",", columns);
-                    if (str.length() > 100) {
-                        row.set(3, str.substring(0, 100) + "...");
-                    } else {
-                        row.set(3, str);
-                    }
-                }
+            statisticExecutor.collectStatistics(statsConnectContext, statsJob, analyzeStatus, true);
+            if (analyzeStatus.getStatus().equals(StatsConstants.ScheduleStatus.FAILED)) {
+                setStatus(StatsConstants.ScheduleStatus.FAILED);
+                setWorkTime(LocalDateTime.now());
+                setReason(analyzeStatus.getReason());
+                GlobalStateMgr.getCurrentAnalyzeMgr().updateAnalyzeJobWithLog(this);
+                hasFailedCollectJob = true;
+                break;
             }
         }
 
-        row.set(4, type.name());
-        row.set(5, scheduleType.name());
-        row.set(6, properties == null ? "{}" : properties.toString());
-        row.set(7, status.name());
-        if (LocalDateTime.MIN.equals(workTime)) {
-            row.set(8, "None");
-        } else {
-            row.set(8, workTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+        if (!hasFailedCollectJob) {
+            setStatus(StatsConstants.ScheduleStatus.PENDING);
+            setWorkTime(LocalDateTime.now());
+            GlobalStateMgr.getCurrentAnalyzeMgr().updateAnalyzeJobWithLog(this);
         }
-
-        if (null != reason) {
-            row.set(9, reason);
-        }
-
-        return row;
     }
 
     @Override
@@ -252,5 +192,4 @@ public class AnalyzeJob implements Writable {
                 ", reason='" + reason + '\'' +
                 '}';
     }
-
 }

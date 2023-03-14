@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/HttpServer.java
 
@@ -35,6 +48,7 @@ import com.starrocks.http.action.SystemAction;
 import com.starrocks.http.action.VariableAction;
 import com.starrocks.http.common.StarRocksHttpPostObjectAggregator;
 import com.starrocks.http.meta.ColocateMetaService;
+import com.starrocks.http.meta.GlobalDictMetaService;
 import com.starrocks.http.meta.MetaService.CheckAction;
 import com.starrocks.http.meta.MetaService.DumpAction;
 import com.starrocks.http.meta.MetaService.ImageAction;
@@ -70,7 +84,8 @@ import com.starrocks.http.rest.StorageTypeCheckAction;
 import com.starrocks.http.rest.TableQueryPlanAction;
 import com.starrocks.http.rest.TableRowCountAction;
 import com.starrocks.http.rest.TableSchemaAction;
-import com.starrocks.master.MetaHelper;
+import com.starrocks.http.rest.TransactionLoadAction;
+import com.starrocks.leader.MetaHelper;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
@@ -112,9 +127,14 @@ public class HttpServer {
         registerActions();
     }
 
+    public ActionController getController() {
+        return controller;
+    }
+
     private void registerActions() throws IllegalArgException {
         // add rest action
         LoadAction.registerAction(controller);
+        TransactionLoadAction.registerAction(controller);
         GetLoadInfoAction.registerAction(controller);
         SetConfigAction.registerAction(controller);
         GetDdlStmtAction.registerAction(controller);
@@ -150,6 +170,9 @@ public class HttpServer {
         ColocateMetaService.BucketSeqAction.registerAction(controller);
         ColocateMetaService.ColocateMetaAction.registerAction(controller);
         ColocateMetaService.MarkGroupStableAction.registerAction(controller);
+        ColocateMetaService.MarkGroupUnstableAction.registerAction(controller);
+        ColocateMetaService.UpdateGroupAction.registerAction(controller);
+        GlobalDictMetaService.ForbitTableAction.registerAction(controller);
         ProfileAction.registerAction(controller);
         QueryDetailAction.registerAction(controller);
         ConnectionAction.registerAction(controller);
@@ -157,7 +180,7 @@ public class HttpServer {
         QueryDumpAction.registerAction(controller);
 
         // meta service action
-        File imageDir = MetaHelper.getMasterImageDir();
+        File imageDir = MetaHelper.getLeaderImageDir();
         ImageAction.registerAction(controller, imageDir);
         InfoAction.registerAction(controller, imageDir);
         VersionAction.registerAction(controller, imageDir);
@@ -183,7 +206,10 @@ public class HttpServer {
     protected class StarrocksHttpServerInitializer extends ChannelInitializer<SocketChannel> {
         @Override
         protected void initChannel(SocketChannel ch) throws Exception {
-            ch.pipeline().addLast(new HttpServerCodec())
+            ch.pipeline().addLast(new HttpServerCodec(
+                            Config.http_max_initial_line_length,
+                            Config.http_max_header_size,
+                            Config.http_max_chunk_size))
                     .addLast(new StarRocksHttpPostObjectAggregator(100 * 65536))
                     .addLast(new ChunkedWriteHandler())
                     // add content compressor

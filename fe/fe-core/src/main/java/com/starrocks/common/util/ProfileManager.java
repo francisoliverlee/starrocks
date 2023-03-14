@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/ProfileManager.java
 
@@ -24,9 +37,11 @@ package com.starrocks.common.util;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.common.Config;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
@@ -51,7 +66,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 public class ProfileManager {
     private static final Logger LOG = LogManager.getLogger(ProfileManager.class);
     private static ProfileManager INSTANCE = null;
-    private static final int ARRAY_SIZE = 1000;
     public static final String QUERY_ID = "Query ID";
     public static final String START_TIME = "Start Time";
     public static final String END_TIME = "End Time";
@@ -61,6 +75,8 @@ public class ProfileManager {
     public static final String SQL_STATEMENT = "Sql Statement";
     public static final String USER = "User";
     public static final String DEFAULT_DB = "Default Db";
+    public static final String VARIABLES = "Variables";
+    public static final String PROFILE_TIME = "Collect Profile Time";
 
     public static final ArrayList<String> PROFILE_HEADERS = new ArrayList(
             Arrays.asList(QUERY_ID, USER, DEFAULT_DB, SQL_STATEMENT, QUERY_TYPE,
@@ -68,7 +84,7 @@ public class ProfileManager {
 
     private class ProfileElement {
         public Map<String, String> infoStrings = Maps.newHashMap();
-        public String profileContent;
+        public byte[] profileContent;
     }
 
     // only protect profileDeque; profileMap is concurrent, no need to protect
@@ -94,13 +110,17 @@ public class ProfileManager {
         profileMap = new ConcurrentHashMap<String, ProfileElement>();
     }
 
-    public ProfileElement createElement(RuntimeProfile profile) {
+    public ProfileElement createElement(RuntimeProfile summaryProfile, String profileString) {
         ProfileElement element = new ProfileElement();
-        RuntimeProfile summaryProfile = profile.getChildList().get(0).first;
         for (String header : PROFILE_HEADERS) {
             element.infoStrings.put(header, summaryProfile.getInfoString(header));
         }
-        element.profileContent = profile.toString();
+        try {
+            element.profileContent = CompressionUtils.gzipCompressString(profileString);
+        } catch (IOException e) {
+            LOG.warn("Compress profile string failed, length: {}, reason: {}",
+                    profileString.length(), e.getMessage());
+        }
         return element;
     }
 
@@ -109,7 +129,21 @@ public class ProfileManager {
             return "";
         }
 
-        ProfileElement element = createElement(profile);
+        String profileString;
+        switch (Config.profile_info_format) {
+            case "default":
+                profileString = profile.toString();
+                break;
+            case "json":
+                RuntimeProfile.ProfileFormater formater = new RuntimeProfile.JsonProfileFormater();
+                profileString = formater.format(profile, "");
+                break;
+            default:
+                profileString = profile.toString();
+                LOG.warn("unknown profile format '{}',  use default format instead.", Config.profile_info_format);
+        }
+
+        ProfileElement element = createElement(profile.getChildList().get(0).first, profileString);
         String queryId = element.infoStrings.get(ProfileManager.QUERY_ID);
         // check when push in, which can ensure every element in the list has QUERY_ID column,
         // so there is no need to check when remove element from list.
@@ -121,7 +155,7 @@ public class ProfileManager {
         profileMap.put(queryId, element);
         writeLock.lock();
         try {
-            if (profileDeque.size() >= ARRAY_SIZE) {
+            if (profileDeque.size() >= Config.profile_info_reserved_num) {
                 profileMap.remove(profileDeque.getFirst().infoStrings.get(QUERY_ID));
                 profileDeque.removeFirst();
             }
@@ -130,7 +164,7 @@ public class ProfileManager {
             writeLock.unlock();
         }
 
-        return element.profileContent;
+        return profileString;
     }
 
     public List<List<String>> getAllQueries() {
@@ -155,14 +189,19 @@ public class ProfileManager {
     }
 
     public String getProfile(String queryID) {
+        ProfileElement element = new ProfileElement();
         readLock.lock();
         try {
-            ProfileElement element = profileMap.get(queryID);
+            element = profileMap.get(queryID);
             if (element == null) {
                 return null;
             }
 
-            return element.profileContent;
+            return CompressionUtils.gzipDecompressString(element.profileContent);
+        } catch (IOException e) {
+            LOG.warn("Decompress profile content failed, length: {}, reason: {}",
+                    element.profileContent.length, e.getMessage());
+            return null;
         } finally {
             readLock.unlock();
         }

@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -38,8 +51,8 @@ public class ExistentialApply2JoinRule extends TransformationRule {
     @Override
     public boolean check(OptExpression input, OptimizerContext context) {
         LogicalApplyOperator apply = (LogicalApplyOperator) input.getOp();
-        return apply.isFromAndScope() && apply.isExistential()
-                && !Utils.containsCorrelationSubquery(input.getGroupExpression());
+        return apply.isUseSemiAnti() && apply.isExistential()
+                && !SubqueryUtils.containsCorrelationSubquery(input);
     }
 
     @Override
@@ -109,7 +122,7 @@ public class ExistentialApply2JoinRule extends TransformationRule {
     //                \
     //            Filter(UnCorrelation)
     private List<OptExpression> transformUnCorrelationExists(OptExpression input, LogicalApplyOperator apply) {
-        OptExpression limitExpression = new OptExpression(new LogicalLimitOperator(1));
+        OptExpression limitExpression = new OptExpression(LogicalLimitOperator.init(1));
         limitExpression.getInputs().add(input.getInputs().get(1));
 
         OptExpression joinExpression = new OptExpression(new LogicalJoinOperator(JoinOperator.CROSS_JOIN, null));

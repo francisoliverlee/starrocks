@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/PropertyAnalyzer.java
 
@@ -21,18 +34,37 @@
 
 package com.starrocks.common.util;
 
+import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.Sets;
+import com.google.common.collect.Streams;
 import com.starrocks.analysis.DateLiteral;
+import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.AggregateType;
+import com.starrocks.catalog.BaseTableInfo;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DataProperty;
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.ForeignKeyConstraint;
+import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.MaterializedView;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
+import com.starrocks.catalog.UniqueConstraint;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.ast.Property;
+import com.starrocks.thrift.TCompressionType;
 import com.starrocks.thrift.TStorageFormat;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TStorageType;
@@ -40,9 +72,15 @@ import com.starrocks.thrift.TTabletType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.stream.Collectors;
+
+import static com.starrocks.catalog.TableProperty.INVALID;
+
 
 public class PropertyAnalyzer {
     private static final Logger LOG = LogManager.getLogger(PropertyAnalyzer.class);
@@ -52,7 +90,7 @@ public class PropertyAnalyzer {
     public static final String PROPERTIES_REPLICATION_NUM = "replication_num";
     public static final String PROPERTIES_STORAGE_TYPE = "storage_type";
     public static final String PROPERTIES_STORAGE_MEDIUM = "storage_medium";
-    public static final String PROPERTIES_STORAGE_COLDOWN_TIME = "storage_cooldown_time";
+    public static final String PROPERTIES_STORAGE_COOLDOWN_TIME = "storage_cooldown_time";
     // for 1.x -> 2.x migration
     public static final String PROPERTIES_VERSION_INFO = "version_info";
     // for restore
@@ -72,6 +110,10 @@ public class PropertyAnalyzer {
 
     public static final String PROPERTIES_DISTRIBUTION_TYPE = "distribution_type";
     public static final String PROPERTIES_SEND_CLEAR_ALTER_TASK = "send_clear_alter_tasks";
+
+    public static final String PROPERTIES_COMPRESSION = "compression";
+
+    public static final String PROPERTIES_COLOCATE_MV = "colocate_mv";
     /*
      * for upgrade alpha rowset to beta rowset, valid value: v1, v2
      * v1: alpha rowset
@@ -81,12 +123,46 @@ public class PropertyAnalyzer {
 
     public static final String PROPERTIES_INMEMORY = "in_memory";
 
+    public static final String PROPERTIES_ENABLE_PERSISTENT_INDEX = "enable_persistent_index";
+
+    public static final String PROPERTIES_BINLOG_VERSION = "binlog_version";
+
+    public static final String PROPERTIES_BINLOG_ENABLE = "binlog_enable";
+
+    public static final String PROPERTIES_BINLOG_TTL = "binlog_ttl_second";
+
+    public static final String PROPERTIES_BINLOG_MAX_SIZE = "binlog_max_size";
+
+    public static final String PROPERTIES_WRITE_QUORUM = "write_quorum";
+
+    public static final String PROPERTIES_REPLICATED_STORAGE = "replicated_storage";
+
     public static final String PROPERTIES_TABLET_TYPE = "tablet_type";
 
     public static final String PROPERTIES_STRICT_RANGE = "strict_range";
     public static final String PROPERTIES_USE_TEMP_PARTITION_NAME = "use_temp_partition_name";
 
     public static final String PROPERTIES_TYPE = "type";
+
+    public static final String ENABLE_LOW_CARD_DICT_TYPE = "enable_low_card_dict";
+    public static final String ABLE_LOW_CARD_DICT = "1";
+    public static final String DISABLE_LOW_CARD_DICT = "0";
+
+    public static final String PROPERTIES_ENABLE_STORAGE_CACHE = "enable_storage_cache";
+    public static final String PROPERTIES_STORAGE_CACHE_TTL = "storage_cache_ttl";
+    public static final String PROPERTIES_ENABLE_ASYNC_WRITE_BACK = "enable_async_write_back";
+    public static final String PROPERTIES_PARTITION_TTL_NUMBER  = "partition_ttl_number";
+    public static final String PROPERTIES_PARTITION_LIVE_NUMBER  = "partition_live_number";
+    public static final String PROPERTIES_AUTO_REFRESH_PARTITIONS_LIMIT  = "auto_refresh_partitions_limit";
+    public static final String PROPERTIES_PARTITION_REFRESH_NUMBER  = "partition_refresh_number";
+    public static final String PROPERTIES_EXCLUDED_TRIGGER_TABLES = "excluded_trigger_tables";
+    public static final String PROPERTIES_FORCE_EXTERNAL_TABLE_QUERY_REWRITE = "force_external_table_query_rewrite";
+
+    public static final String PROPERTIES_STORAGE_VOLUME = "storage_volume";
+
+    // constraint for rewrite
+    public static final String PROPERTIES_FOREIGN_KEY_CONSTRAINT = "foreign_key_constraints";
+    public static final String PROPERTIES_UNIQUE_CONSTRAINT = "unique_constraints";
 
     public static DataProperty analyzeDataProperty(Map<String, String> properties, DataProperty oldDataProperty)
             throws AnalysisException {
@@ -111,7 +187,7 @@ public class PropertyAnalyzer {
                 } else {
                     throw new AnalysisException("Invalid storage medium: " + value);
                 }
-            } else if (!hasCooldown && key.equalsIgnoreCase(PROPERTIES_STORAGE_COLDOWN_TIME)) {
+            } else if (!hasCooldown && key.equalsIgnoreCase(PROPERTIES_STORAGE_COOLDOWN_TIME)) {
                 hasCooldown = true;
                 DateLiteral dateLiteral = new DateLiteral(value, Type.DATETIME);
                 coolDownTimeStamp = dateLiteral.unixTimestamp(TimeUtils.getTimeZone());
@@ -123,7 +199,7 @@ public class PropertyAnalyzer {
         }
 
         properties.remove(PROPERTIES_STORAGE_MEDIUM);
-        properties.remove(PROPERTIES_STORAGE_COLDOWN_TIME);
+        properties.remove(PROPERTIES_STORAGE_COOLDOWN_TIME);
 
         if (hasCooldown && !hasMedium) {
             throw new AnalysisException("Invalid data property. storage medium property is not found");
@@ -142,7 +218,11 @@ public class PropertyAnalyzer {
 
         if (storageMedium == TStorageMedium.SSD && !hasCooldown) {
             // set default cooldown time
-            coolDownTimeStamp = currentTimeMs + Config.storage_cooldown_second * 1000L;
+            coolDownTimeStamp = ((Config.tablet_sched_storage_cooldown_second <= 0) ||
+                    ((DataProperty.MAX_COOLDOWN_TIME_MS - currentTimeMs) / 1000L <
+                            Config.tablet_sched_storage_cooldown_second)) ?
+                    DataProperty.MAX_COOLDOWN_TIME_MS :
+                    currentTimeMs + Config.tablet_sched_storage_cooldown_second * 1000L;
         }
 
         Preconditions.checkNotNull(storageMedium);
@@ -152,7 +232,7 @@ public class PropertyAnalyzer {
     public static short analyzeShortKeyColumnCount(Map<String, String> properties) throws AnalysisException {
         short shortKeyColumnCount = (short) -1;
         if (properties != null && properties.containsKey(PROPERTIES_SHORT_KEY)) {
-            // check and use speciefied short key
+            // check and use specified short key
             try {
                 shortKeyColumnCount = Short.parseShort(properties.get(PROPERTIES_SHORT_KEY));
             } catch (NumberFormatException e) {
@@ -169,6 +249,110 @@ public class PropertyAnalyzer {
         return shortKeyColumnCount;
     }
 
+    public static int analyzePartitionTimeToLive(Map<String, String> properties) throws AnalysisException {
+        int partitionTimeToLive = INVALID;
+        if (properties != null && properties.containsKey(PROPERTIES_PARTITION_TTL_NUMBER)) {
+            try {
+                partitionTimeToLive = Integer.parseInt(properties.get(PROPERTIES_PARTITION_TTL_NUMBER));
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Partition TTL Number: " + e.getMessage());
+            }
+            if (partitionTimeToLive <= 0 && partitionTimeToLive != INVALID) {
+                throw new AnalysisException("Illegal Partition TTL Number: " + partitionTimeToLive);
+            }
+            properties.remove(PROPERTIES_PARTITION_TTL_NUMBER);
+        }
+        return partitionTimeToLive;
+    }
+
+    public static int analyzePartitionLiveNumber(Map<String, String> properties,
+                                                 boolean removeProperties) throws AnalysisException {
+        int partitionLiveNumber = INVALID;
+        if (properties != null && properties.containsKey(PROPERTIES_PARTITION_LIVE_NUMBER)) {
+            try {
+                partitionLiveNumber = Integer.parseInt(properties.get(PROPERTIES_PARTITION_LIVE_NUMBER));
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Partition Live Number: " + e.getMessage());
+            }
+            if (partitionLiveNumber <= 0 && partitionLiveNumber != INVALID) {
+                throw new AnalysisException("Illegal Partition Live Number: " + partitionLiveNumber);
+            }
+            if (removeProperties) {
+                properties.remove(PROPERTIES_PARTITION_LIVE_NUMBER);
+            }
+        }
+        return partitionLiveNumber;
+    }
+
+    public static int analyzeAutoRefreshPartitionsLimit(Map<String, String> properties, MaterializedView mv)
+            throws AnalysisException {
+        if (mv.getRefreshScheme().getType() == MaterializedView.RefreshType.MANUAL) {
+            throw new AnalysisException("The auto_refresh_partitions_limit property does not support manual refresh mode.");
+        }
+        int autoRefreshPartitionsLimit = -1;
+        if (properties != null && properties.containsKey(PROPERTIES_AUTO_REFRESH_PARTITIONS_LIMIT)) {
+            try {
+                autoRefreshPartitionsLimit = Integer.parseInt(properties.get(PROPERTIES_AUTO_REFRESH_PARTITIONS_LIMIT));
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Auto Refresh Partitions Limit: " + e.getMessage());
+            }
+            if (autoRefreshPartitionsLimit <= 0 && autoRefreshPartitionsLimit != INVALID) {
+                throw new AnalysisException("Illegal Auto Refresh Partitions Limit: " + autoRefreshPartitionsLimit);
+            }
+            properties.remove(PROPERTIES_AUTO_REFRESH_PARTITIONS_LIMIT);
+        }
+        return autoRefreshPartitionsLimit;
+    }
+
+    public static int analyzePartitionRefreshNumber(Map<String, String> properties) throws AnalysisException {
+        int partitionRefreshNumber = -1;
+        if (properties != null && properties.containsKey(PROPERTIES_PARTITION_REFRESH_NUMBER)) {
+            try {
+                partitionRefreshNumber = Integer.parseInt(properties.get(PROPERTIES_PARTITION_REFRESH_NUMBER));
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Partition Refresh Number: " + e.getMessage());
+            }
+            if (partitionRefreshNumber <= 0 && partitionRefreshNumber != INVALID) {
+                throw new AnalysisException("Illegal Partition Refresh Number: " + partitionRefreshNumber);
+            }
+            properties.remove(PROPERTIES_PARTITION_REFRESH_NUMBER);
+        }
+        return partitionRefreshNumber;
+    }
+
+    public static List<TableName> analyzeExcludedTriggerTables(Map<String, String> properties, MaterializedView mv)
+            throws AnalysisException {
+        if (mv.getRefreshScheme().getType() != MaterializedView.RefreshType.ASYNC) {
+            throw new AnalysisException("The excluded_trigger_tables property only applies to asynchronous refreshes.");
+        }
+        List<TableName> tables = Lists.newArrayList();
+        if (properties != null && properties.containsKey(PROPERTIES_EXCLUDED_TRIGGER_TABLES)) {
+            String tableStr = properties.get(PROPERTIES_EXCLUDED_TRIGGER_TABLES);
+            List<String> tableList = Splitter.on(",").omitEmptyStrings().trimResults().splitToList(tableStr);
+            for (String table : tableList) {
+                TableName tableName = AnalyzerUtils.stringToTableName(table);
+                if (mv.containsBaseTable(tableName)) {
+                    tables.add(tableName);
+                } else {
+                    throw new AnalysisException(tableName.toSql() +
+                            " is not base table of materialized view " + mv.getName());
+                }
+            }
+            properties.remove(PROPERTIES_EXCLUDED_TRIGGER_TABLES);
+        }
+        return tables;
+    }
+
+    public static boolean analyzeForceExternalTableQueryRewrite(Map<String, String> properties) {
+        boolean forceExternalTableQueryRewrite = false;
+        if (properties != null && properties.containsKey(PROPERTIES_FORCE_EXTERNAL_TABLE_QUERY_REWRITE)) {
+            forceExternalTableQueryRewrite = Boolean.parseBoolean(properties.
+                        get(PROPERTIES_FORCE_EXTERNAL_TABLE_QUERY_REWRITE));
+            properties.remove(PROPERTIES_FORCE_EXTERNAL_TABLE_QUERY_REWRITE);
+        }
+        return forceExternalTableQueryRewrite;
+    }
+
     public static Short analyzeReplicationNum(Map<String, String> properties, short oldReplicationNum)
             throws AnalysisException {
         short replicationNum = oldReplicationNum;
@@ -178,11 +362,7 @@ public class PropertyAnalyzer {
             } catch (Exception e) {
                 throw new AnalysisException(e.getMessage());
             }
-
-            if (replicationNum <= 0) {
-                throw new AnalysisException("Replication num should larger than 0. (suggested 3)");
-            }
-
+            checkReplicationNum(replicationNum);
             properties.remove(PROPERTIES_REPLICATION_NUM);
         }
         return replicationNum;
@@ -197,10 +377,26 @@ public class PropertyAnalyzer {
             key = PropertyAnalyzer.PROPERTIES_REPLICATION_NUM;
         }
         short replicationNum = Short.parseShort(properties.get(key));
-        if (replicationNum <= 0) {
-            throw new AnalysisException("Replication num should larger than 0. (suggested 3)");
-        }
+        checkReplicationNum(replicationNum);
         return replicationNum;
+    }
+
+    private static void checkReplicationNum(short replicationNum) throws AnalysisException {
+        if (replicationNum <= 0) {
+            throw new AnalysisException("Replication num should larger than 0");
+        }
+        List<Long> backendIds = GlobalStateMgr.getCurrentSystemInfo().getAvailableBackendIds();
+        if (RunMode.getCurrentRunMode() == RunMode.SHARED_DATA) {
+            if (RunMode.defaultReplicationNum() > backendIds.size()) {
+                throw new AnalysisException("Number of available BE nodes is " + backendIds.size()
+                        + ", less than " + RunMode.defaultReplicationNum());
+            }
+        } else {
+            if (replicationNum > backendIds.size()) {
+                throw new AnalysisException("Replication num should be less than the number of available BE nodes. "
+                        + "Replication num is " + replicationNum + " available BE nodes is " + backendIds.size());
+            }
+        }
     }
 
     public static String analyzeColumnSeparator(Map<String, String> properties, String oldColumnSeparator) {
@@ -255,21 +451,14 @@ public class PropertyAnalyzer {
         return tTabletType;
     }
 
-    public static Pair<Long, Long> analyzeVersionInfo(Map<String, String> properties) throws AnalysisException {
-        Pair<Long, Long> versionInfo = new Pair<>(Partition.PARTITION_INIT_VERSION,
-                Partition.PARTITION_INIT_VERSION_HASH);
+    public static Long analyzeVersionInfo(Map<String, String> properties) throws AnalysisException {
+        long versionInfo = Partition.PARTITION_INIT_VERSION;
         if (properties != null && properties.containsKey(PROPERTIES_VERSION_INFO)) {
             String versionInfoStr = properties.get(PROPERTIES_VERSION_INFO);
-            String[] versionInfoArr = versionInfoStr.split(COMMA_SEPARATOR);
-            if (versionInfoArr.length == 2) {
-                try {
-                    versionInfo.first = Long.parseLong(versionInfoArr[0]);
-                    versionInfo.second = Long.parseLong(versionInfoArr[1]);
-                } catch (NumberFormatException e) {
-                    throw new AnalysisException("version info number format error");
-                }
-            } else {
-                throw new AnalysisException("version info format error. format: version,version_hash");
+            try {
+                versionInfo = Long.parseLong(versionInfoStr);
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("version info format error.");
             }
 
             properties.remove(PROPERTIES_VERSION_INFO);
@@ -294,8 +483,8 @@ public class PropertyAnalyzer {
         return schemaVersion;
     }
 
-    public static Set<String> analyzeBloomFilterColumns(Map<String, String> properties, List<Column> columns)
-            throws AnalysisException {
+    public static Set<String> analyzeBloomFilterColumns(Map<String, String> properties, List<Column> columns,
+                                                        boolean isPrimaryKey) throws AnalysisException {
         Set<String> bfColumns = null;
         if (properties != null && properties.containsKey(PROPERTIES_BF_COLUMNS)) {
             bfColumns = Sets.newHashSet();
@@ -320,17 +509,16 @@ public class PropertyAnalyzer {
                 Type type = column.getType();
 
                 // tinyint/float/double columns don't support
-                if (!type.isScalarType() || type.isFloatingPointType() || type.isTinyint() ||
-                        type.isBoolean() || type.isDecimalV3()) {
+                if (!type.supportBloomFilter()) {
                     throw new AnalysisException(String.format("Invalid bloom filter column '%s': unsupported type %s",
                             bfColumn, type));
                 }
 
-                // Only support create bloom filter on duplicate table or key columns of UNIQUE/AGGREGATE table.
-                if (!(column.isKey() || column.getAggregationType() == AggregateType.NONE)) {
-                    // Although the implementation supports bf for replace non-key column,
+                // Only support create bloom filter on DUPLICATE/PRIMARY table or key columns of UNIQUE/AGGREGATE table.
+                if (!(column.isKey() || isPrimaryKey || column.getAggregationType() == AggregateType.NONE)) {
+                    // Although the implementation supports bloom filter for replace non-key column,
                     // for simplicity and unity, we don't expose that to user.
-                    throw new AnalysisException("Bloom filter index only used in columns of DUP_KEYS table or "
+                    throw new AnalysisException("Bloom filter index only used in columns of DUP_KEYS/PRIMARY table or "
                             + "key columns of UNIQUE_KEYS/AGG_KEYS table. invalid column: " + bfColumn);
                 }
 
@@ -415,6 +603,42 @@ public class PropertyAnalyzer {
         }
     }
 
+    // analyzeCompressionType will parse the compression type from properties
+    public static TCompressionType analyzeCompressionType(Map<String, String> properties) throws AnalysisException {
+        TCompressionType compressionType = TCompressionType.LZ4_FRAME;
+        if (ConnectContext.get() != null) {
+            String defaultCompression = ConnectContext.get().getSessionVariable().getDefaultTableCompression();
+            compressionType = CompressionUtils.getCompressTypeByName(defaultCompression);
+        }
+        if (properties == null || !properties.containsKey(PROPERTIES_COMPRESSION)) {
+            return compressionType;
+        }
+        String compressionName = properties.get(PROPERTIES_COMPRESSION);
+        properties.remove(PROPERTIES_COMPRESSION);
+
+        if (CompressionUtils.getCompressTypeByName(compressionName) != null) {
+            return CompressionUtils.getCompressTypeByName(compressionName);
+        } else {
+            throw new AnalysisException("unknown compression type: " + compressionName);
+        }
+    }
+
+    // analyzeWriteQuorum will parse to write quorum from properties
+    public static String analyzeWriteQuorum(Map<String, String> properties) throws AnalysisException {
+        String writeQuorum;
+        if (properties == null || !properties.containsKey(PROPERTIES_WRITE_QUORUM)) {
+            return WriteQuorum.MAJORITY;
+        }
+        writeQuorum = properties.get(PROPERTIES_WRITE_QUORUM);
+        properties.remove(PROPERTIES_WRITE_QUORUM);
+
+        if (WriteQuorum.findTWriteQuorumByName(writeQuorum) != null) {
+            return writeQuorum;
+        } else {
+            throw new AnalysisException("unknown write quorum: " + writeQuorum);
+        }
+    }
+
     // analyze common boolean properties, such as "in_memory" = "false"
     public static boolean analyzeBooleanProp(Map<String, String> properties, String propKey, boolean defaultVal) {
         if (properties != null && properties.containsKey(propKey)) {
@@ -433,5 +657,196 @@ public class PropertyAnalyzer {
             properties.remove(PROPERTIES_TYPE);
         }
         return type;
+    }
+
+    public static String analyzeType(Property property) {
+        String type = null;
+        if (PROPERTIES_TYPE.equals(property.getKey())) {
+            type = property.getValue();
+        }
+        return type;
+    }
+
+    public static long analyzeLongProp(Map<String, String> properties, String propKey, long defaultVal)
+            throws AnalysisException {
+        long val = defaultVal;
+        if (properties != null && properties.containsKey(propKey)) {
+            String valStr = properties.get(propKey);
+            try {
+                val = Long.parseLong(valStr);
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Invalid " + propKey + " format: " + valStr);
+            }
+            properties.remove(propKey);
+        }
+        return val;
+    }
+
+    public static List<UniqueConstraint> analyzeUniqueConstraint(
+            Map<String, String> properties, OlapTable table) throws AnalysisException {
+        List<UniqueConstraint> uniqueConstraints = Lists.newArrayList();
+        if (properties != null && properties.containsKey(PROPERTIES_UNIQUE_CONSTRAINT)) {
+            String uniqueConstraintStr = properties.get(PROPERTIES_UNIQUE_CONSTRAINT);
+            if (Strings.isNullOrEmpty(uniqueConstraintStr)) {
+                return uniqueConstraints;
+            }
+            uniqueConstraints = UniqueConstraint.parse(uniqueConstraintStr);
+            if (uniqueConstraints == null || uniqueConstraints.isEmpty()) {
+                throw new AnalysisException(String.format("invalid unique constraint:%s", uniqueConstraintStr));
+            }
+
+            for (UniqueConstraint uniqueConstraint : uniqueConstraints) {
+                boolean columnExist = uniqueConstraint.getUniqueColumns().stream().allMatch(table::containColumn);
+                if (!columnExist) {
+                    throw new AnalysisException(
+                            String.format("some columns of:%s do not exist in table:%s",
+                                    uniqueConstraint.getUniqueColumns(), table.getName()));
+                }
+            }
+            properties.remove(PROPERTIES_UNIQUE_CONSTRAINT);
+        }
+        return uniqueConstraints;
+    }
+
+    public static List<ForeignKeyConstraint> analyzeForeignKeyConstraint(
+            Map<String, String> properties, Database db, Table baseTable) throws AnalysisException {
+        List<ForeignKeyConstraint> foreignKeyConstraints = Lists.newArrayList();
+        if (properties != null && properties.containsKey(PROPERTIES_FOREIGN_KEY_CONSTRAINT)) {
+            String foreignKeyConstraintsDesc = properties.get(PROPERTIES_FOREIGN_KEY_CONSTRAINT);
+            if (Strings.isNullOrEmpty(foreignKeyConstraintsDesc)) {
+                return foreignKeyConstraints;
+            }
+            if (Strings.isNullOrEmpty(foreignKeyConstraintsDesc)) {
+                throw new AnalysisException("empty foreign key constraint is invalid");
+            }
+            String[] foreignKeyConstraintDescArray = foreignKeyConstraintsDesc.trim().split(";");
+            for (String foreignKeyConstraintDesc : foreignKeyConstraintDescArray) {
+                String trimed = foreignKeyConstraintDesc.trim();
+                if (Strings.isNullOrEmpty(trimed)) {
+                    continue;
+                }
+                Matcher foreignKeyMatcher = ForeignKeyConstraint.FOREIGN_KEY_PATTERN.matcher(trimed);
+                if (!foreignKeyMatcher.find() || foreignKeyMatcher.groupCount() != 7) {
+                    throw new AnalysisException(String.format("invalid foreign key constraint:%s", foreignKeyConstraintDesc));
+                }
+                String sourceColumns = foreignKeyMatcher.group(1);
+                String tablePath = foreignKeyMatcher.group(4);
+                String targetColumns = foreignKeyMatcher.group(6);
+                List<String> baseColumns = Arrays.asList(sourceColumns.split(","))
+                        .stream().map(String::trim).collect(Collectors.toList());
+                List<String> parentColumns = Arrays.asList(targetColumns.split(","))
+                        .stream().map(String::trim).collect(Collectors.toList());
+                if (baseColumns.size() != parentColumns.size()) {
+                    throw new AnalysisException(String.format("invalid foreign key constraint:%s," +
+                            " columns' size does not match", foreignKeyConstraintDesc));
+                }
+
+                String[] parts = tablePath.split("\\.");
+                String catalogName = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
+                String dbName = db.getFullName();
+                String parentTableName = "";
+                if (parts.length == 3) {
+                    catalogName = parts[0];
+                    dbName = parts[1];
+                    parentTableName = parts[2];
+                } else if (parts.length == 2) {
+                    dbName = parts[0];
+                    parentTableName = parts[1];
+                } else if (parts.length == 1) {
+                    parentTableName = parts[0];
+                } else {
+                    throw new AnalysisException(String.format("invalid foreign key constraint:%s," +
+                            "table path is invalid", foreignKeyConstraintDesc));
+                }
+
+                if (!GlobalStateMgr.getCurrentState().getCatalogMgr().catalogExists(catalogName)) {
+                    throw new AnalysisException(String.format("catalog: %s do not exist", catalogName));
+                }
+                Database parentDb = GlobalStateMgr.getCurrentState().getMetadataMgr().getDb(catalogName, dbName);
+                if (parentDb == null) {
+                    throw new AnalysisException(String.format("catalog: %s, database: %s do not exist", catalogName, dbName));
+                }
+                Table parentTable =
+                        GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(catalogName, dbName, parentTableName);
+                if (parentTable == null) {
+                    throw new AnalysisException(String.format("catalog:%s, database: %s, table:%s do not exist",
+                            catalogName, dbName, parentTableName));
+                }
+
+                if (!baseTable.isLocalTable()) {
+                    throw new AnalysisException("now do not support add foreign key on external table");
+                }
+
+                OlapTable baseOlapTable = (OlapTable) baseTable;
+                if (!baseColumns.stream().allMatch(baseOlapTable::containColumn)) {
+                    throw new AnalysisException(String.format("some columns of:%s do not exist in table:%s",
+                            baseColumns, baseOlapTable.getName()));
+                }
+
+                OlapTable parentOlapTable = (OlapTable) parentTable;
+                if (!parentColumns.stream().allMatch(parentOlapTable::containColumn)) {
+                    throw new AnalysisException(String.format("some columns of:%s do not exist in parent table:%s",
+                            parentColumns, parentOlapTable.getName()));
+                }
+                KeysType parentTableKeyType =
+                        parentOlapTable.getIndexMetaByIndexId(parentOlapTable.getBaseIndexId()).getKeysType();
+                if (parentTableKeyType == KeysType.AGG_KEYS) {
+                    throw new AnalysisException(String.format("do not support reference agg table:%s", parentTable.getName()));
+                } else if (parentTableKeyType == KeysType.DUP_KEYS) {
+                    if (!parentOlapTable.hasUniqueConstraints()) {
+                        throw new AnalysisException(
+                                String.format("dup table:%s has no unique constraint", parentTable.getName()));
+                    } else {
+                        List<UniqueConstraint> uniqueConstraints = parentOlapTable.getUniqueConstraints();
+                        boolean matched = false;
+                        for (UniqueConstraint uniqueConstraint : uniqueConstraints) {
+                            if (uniqueConstraint.getUniqueColumns().containsAll(parentColumns)) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (!matched) {
+                            throw new AnalysisException(String.format("columns:%s are not dup table:%s's unique constraint",
+                                    parentColumns, parentTable.getName()));
+                        }
+                    }
+                } else {
+                    // for PRIMARY_KEYS and UNIQUE_KEYS type table
+                    // parent columns should be keys
+                    List<String> keyColumnNames =
+                            parentOlapTable.getKeyColumns().stream().map(Column::getName).collect(Collectors.toList());
+                    if (!keyColumnNames.equals(parentColumns)) {
+                        throw new AnalysisException(String.format("columns:%s are not key columns of table:%s",
+                                parentColumns, parentTable.getName()));
+                    }
+                }
+                List<Pair<String, String>> columnRefPairs =
+                        Streams.zip(baseColumns.stream(), parentColumns.stream(), Pair::create).collect(Collectors.toList());
+                for (Pair<String, String> pair : columnRefPairs) {
+                    Column childColumn = baseOlapTable.getColumn(pair.first);
+                    Column parentColumn = parentTable.getColumn(pair.second);
+                    if (!childColumn.getType().equals(parentColumn.getType())) {
+                        throw new AnalysisException(String.format(
+                                "column:%s type does mot match referenced column:%s type", pair.first, pair.second));
+                    }
+                }
+
+                BaseTableInfo parentTableInfo;
+                if (catalogName.equals(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)) {
+                    parentTableInfo = new BaseTableInfo(parentDb.getId(), dbName, parentTable.getId());
+                } else {
+                    parentTableInfo = new BaseTableInfo(catalogName, dbName, parentTable.getTableIdentifier());
+                }
+
+                ForeignKeyConstraint foreignKeyConstraint = new ForeignKeyConstraint(parentTableInfo, columnRefPairs);
+                foreignKeyConstraints.add(foreignKeyConstraint);
+            }
+            if (foreignKeyConstraints.isEmpty()) {
+                throw new AnalysisException(String.format("invalid foreign key constrain:%s", foreignKeyConstraintsDesc));
+            }
+            properties.remove(PROPERTIES_FOREIGN_KEY_CONSTRAINT);
+        }
+
+        return foreignKeyConstraints;
     }
 }

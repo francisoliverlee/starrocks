@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/LiteralExpr.java
 
@@ -25,7 +38,10 @@ import com.google.common.base.Preconditions;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.NotImplementedException;
-import com.starrocks.sql.analyzer.ExprVisitor;
+import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.StarRocksPlannerException;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -35,7 +51,12 @@ import java.nio.charset.StandardCharsets;
 
 public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr> {
     public LiteralExpr() {
+        super();
         numDistinctValues = 1;
+    }
+
+    protected LiteralExpr(NodePosition pos) {
+        super(pos);
     }
 
     protected LiteralExpr(LiteralExpr other) {
@@ -115,12 +136,10 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     }
 
     /*
-     * return real value
+     * return real object value
      */
-    public Object getRealValue() {
-        // implemented: TINYINT/SMALLINT/INT/BIGINT/LARGEINT/DATE/DATETIME
-        Preconditions.checkState(false, "should implement this in derived class. " + this.type.toSql());
-        return null;
+    public Object getRealObjectValue() {
+        throw new StarRocksPlannerException("Not implement getRealObjectValue in derived class. ", ErrorType.INTERNAL_ERROR);
     }
 
     public abstract boolean isMinValue();
@@ -175,6 +194,11 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     }
 
     @Override
+    public int hashCode() {
+        return super.hashCode();
+    }
+
+    @Override
     public boolean equals(Object obj) {
         if (this == obj) {
             return true;
@@ -182,7 +206,7 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         if (!(obj instanceof LiteralExpr)) {
             return false;
         }
-        //TODO chenhao16, call super.equals()
+
         if ((obj instanceof StringLiteral && !(this instanceof StringLiteral))
                 || (this instanceof StringLiteral && !(obj instanceof StringLiteral))
                 || (obj instanceof DecimalLiteral && !(this instanceof DecimalLiteral))
@@ -197,9 +221,8 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         return this instanceof NullLiteral;
     }
 
-    @Override
-    public boolean isVectorized() {
-        return true;
+    public boolean isConstantNull() {
+        return this instanceof NullLiteral;
     }
 
     @Override
@@ -211,7 +234,12 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
      * Below function is added by new analyzer
      */
     @Override
-    public <R, C> R accept(ExprVisitor<R, C> visitor, C context) {
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitLiteral(this, context);
+    }
+
+    @Override
+    public boolean isSelfMonotonic() {
+        return true;
     }
 }

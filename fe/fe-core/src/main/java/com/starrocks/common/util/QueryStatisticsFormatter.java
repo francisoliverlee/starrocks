@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/QueryStatisticsFormatter.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -27,17 +23,26 @@ import java.util.Formatter;
 
 public class QueryStatisticsFormatter {
 
-    public static String getScanBytes(long scanBytes) {
-        final Pair<Double, String> pair = DebugUtil.getByteUint(scanBytes);
-        final Formatter fmt = new Formatter();
-        final StringBuilder builder = new StringBuilder();
-        builder.append(fmt.format("%.2f", pair.first)).append(" ").append(pair.second);
-        return builder.toString();
+    public static String getBytes(long bytes) {
+        final Pair<Double, String> pair = DebugUtil.getByteUint(bytes);
+        try (final Formatter fmt = new Formatter()) {
+            final StringBuilder builder = new StringBuilder();
+            builder.append(fmt.format("%.2f", pair.first)).append(" ").append(pair.second);
+            return builder.toString();
+        }
     }
 
     public static String getRowsReturned(long rowsReturned) {
         final StringBuilder builder = new StringBuilder();
         builder.append(rowsReturned).append(" Rows");
+        return builder.toString();
+    }
+
+    public static String getCPUCostSeconds(long cpuCostNs) {
+        final StringBuilder builder = new StringBuilder();
+        try (final Formatter fmt = new Formatter()) {
+            builder.append(fmt.format("%.2f", cpuCostNs * 1.0 / 1000000000)).append(" ").append("Seconds");
+        }
         return builder.toString();
     }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/BrokerFileGroup.java
 
@@ -25,15 +38,11 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.analysis.DataDescription;
 import com.starrocks.analysis.Delimiter;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.ImportColumnDesc;
-import com.starrocks.analysis.PartitionNames;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.BrokerTable;
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.HiveTable;
@@ -43,11 +52,16 @@ import com.starrocks.catalog.OlapTable.OlapTableState;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.CsvFormat;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.DataDescription;
+import com.starrocks.sql.ast.ImportColumnDesc;
+import com.starrocks.sql.ast.PartitionNames;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -89,9 +103,18 @@ public class BrokerFileGroup implements Writable {
     // load from table
     private long srcTableId = -1;
     private boolean isLoadFromTable = false;
+    
+    // for csv
+    private CsvFormat csvFormat;
+
+    public static final String ESCAPE = "escape";
+    public static final String ENCLOSE = "enclose";
+    public static final String TRIMSPACE = "trim_space";
+    public static final String SKIPHEADER = "skip_header";
 
     // for unit test and edit log persistence
     private BrokerFileGroup() {
+        this.csvFormat = new CsvFormat((byte) 0, (byte) 0, 0, false);
     }
 
     // Used for broker table, no need to parse
@@ -102,6 +125,7 @@ public class BrokerFileGroup implements Writable {
         this.isNegative = false;
         this.filePaths = table.getPaths();
         this.fileFormat = table.getFileFormat();
+        this.csvFormat = new CsvFormat((byte) 0, (byte) 0, 0, false);
     }
 
     public BrokerFileGroup(DataDescription dataDescription) {
@@ -110,6 +134,14 @@ public class BrokerFileGroup implements Writable {
         this.columnExprList = dataDescription.getParsedColumnExprList();
         this.columnToHadoopFunction = dataDescription.getColumnToHadoopFunction();
         this.whereExpr = dataDescription.getWhereExpr();
+        this.csvFormat = new CsvFormat((byte) 0, (byte) 0, 0, false);
+    }
+
+    public void parseFormatProperties(DataDescription dataDescription) {
+        CsvFormat csvFormat = dataDescription.getCsvFormat();
+        if (csvFormat != null) {
+            this.csvFormat = csvFormat;
+        }
     }
 
     // NOTE: DBLock will be held
@@ -119,7 +151,7 @@ public class BrokerFileGroup implements Writable {
         Table table = db.getTable(dataDescription.getTableName());
         if (table == null) {
             throw new DdlException("Unknown table " + dataDescription.getTableName()
-                    + " in database " + db.getFullName());
+                    + " in database " + db.getOriginName());
         }
         if (!(table instanceof OlapTable)) {
             throw new DdlException("Table " + table.getName() + " is not OlapTable");
@@ -176,6 +208,8 @@ public class BrokerFileGroup implements Writable {
         }
         isNegative = dataDescription.isNegative();
 
+        parseFormatProperties(dataDescription);
+
         // FilePath
         filePaths = dataDescription.getFilePaths();
 
@@ -184,7 +218,7 @@ public class BrokerFileGroup implements Writable {
             // src table should be hive table
             Table srcTable = db.getTable(srcTableName);
             if (srcTable == null) {
-                throw new DdlException("Unknown table " + srcTableName + " in database " + db.getFullName());
+                throw new DdlException("Unknown table " + srcTableName + " in database " + db.getOriginName());
             }
             if (!(srcTable instanceof HiveTable)) {
                 throw new DdlException("Source table " + srcTableName + " is not HiveTable");
@@ -287,6 +321,22 @@ public class BrokerFileGroup implements Writable {
 
     public boolean isLoadFromTable() {
         return isLoadFromTable;
+    }
+
+    public long getSkipHeader() {
+        return csvFormat.getSkipheader();
+    }
+
+    public byte getEnclose() {
+        return csvFormat.getEnclose();
+    }
+
+    public byte getEscape() {
+        return csvFormat.getEscape();
+    }
+
+    public boolean isTrimspace() {
+        return csvFormat.isTrimspace();
     }
 
     @Override
@@ -438,13 +488,13 @@ public class BrokerFileGroup implements Writable {
             }
         }
         // file format
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_50) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_50) {
             if (in.readBoolean()) {
                 fileFormat = Text.readString(in);
             }
         }
         // src table
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_87) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_87) {
             srcTableId = in.readLong();
             isLoadFromTable = in.readBoolean();
         }

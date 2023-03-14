@@ -1,7 +1,3 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/BrokerDesc.java
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -25,6 +21,8 @@ import com.google.common.collect.Maps;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.PrintableMap;
+import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -39,20 +37,47 @@ import java.util.Map;
 //   "username" = "user0",
 //   "password" = "password0"
 // )
-public class BrokerDesc implements Writable {
+public class BrokerDesc implements ParseNode, Writable {
     private String name;
     private Map<String, String> properties;
+    private boolean hasBroker;
+
+    private final NodePosition pos;
 
     // Only used for recovery
     private BrokerDesc() {
+        pos = NodePosition.ZERO;
+    }
+
+    public BrokerDesc(Map<String, String> properties) {
+        this(properties, NodePosition.ZERO);
     }
 
     public BrokerDesc(String name, Map<String, String> properties) {
+        this(name, properties, NodePosition.ZERO);
+    }
+    public BrokerDesc(String name, Map<String, String> properties, NodePosition pos) {
+        this.pos = pos;
+        this.hasBroker = true;
         this.name = name;
         this.properties = properties;
         if (this.properties == null) {
             this.properties = Maps.newHashMap();
         }
+    }
+
+    public BrokerDesc(Map<String, String> properties, NodePosition pos) {
+        this.pos = pos;
+        this.hasBroker = false;
+        this.name = "";
+        this.properties = properties;
+        if (this.properties == null) {
+            this.properties = Maps.newHashMap();
+        }
+    }
+
+    public boolean hasBroker() {
+        return hasBroker;
     }
 
     public String getName() {
@@ -61,6 +86,13 @@ public class BrokerDesc implements Writable {
 
     public Map<String, String> getProperties() {
         return properties;
+    }
+
+    public String getMergeConditionStr() {
+        if (properties.containsKey(LoadStmt.MERGE_CONDITION)) {
+            return properties.get(LoadStmt.MERGE_CONDITION);
+        }
+        return "";
     }
 
     @Override
@@ -90,7 +122,7 @@ public class BrokerDesc implements Writable {
         return desc;
     }
 
-    public String toSql() {
+    public String toString() {
         StringBuilder sb = new StringBuilder();
         sb.append("WITH BROKER ").append(name);
         if (properties != null && !properties.isEmpty()) {
@@ -98,5 +130,10 @@ public class BrokerDesc implements Writable {
             sb.append(" (").append(printableMap.toString()).append(")");
         }
         return sb.toString();
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 }

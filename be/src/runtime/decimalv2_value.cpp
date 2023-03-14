@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/decimalv2_value.cpp
 
@@ -20,6 +33,8 @@
 // under the License.
 
 #include "runtime/decimalv2_value.h"
+
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <iostream>
@@ -209,7 +224,7 @@ int128_t div(const int128_t& x, const int128_t& y) {
 
     if (!is_positive) result = -result;
 
-    return DecimalV2Value(result);
+    return result;
 }
 
 DecimalV2Value operator/(const DecimalV2Value& v1, const DecimalV2Value& v2) {
@@ -249,6 +264,11 @@ DecimalV2Value operator-(const DecimalV2Value& v) {
 
 DecimalV2Value& DecimalV2Value::operator+=(const DecimalV2Value& other) {
     *this = *this + other;
+    return *this;
+}
+
+DecimalV2Value& DecimalV2Value::operator-=(const DecimalV2Value& other) {
+    *this = *this - other;
     return *this;
 }
 
@@ -392,7 +412,7 @@ void DecimalV2Value::to_max_decimal(int32_t precision, int32_t scale) {
         precision = PRECISION - SCALE + scale;
     } else if (precision <= scale) {
         LOG(WARNING) << "Warning: error precision: " << precision << " or scale: " << scale;
-        precision = scale + 1; // corect error precision
+        precision = scale + 1; // correct error precision
     }
 
     int64_t int_value = INT_MAX_VALUE[precision - scale - 1];

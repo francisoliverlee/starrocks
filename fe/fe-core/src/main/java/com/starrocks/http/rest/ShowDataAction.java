@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/rest/ShowDataAction.java
 
@@ -21,7 +34,6 @@
 
 package com.starrocks.http.rest;
 
-import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
@@ -30,6 +42,7 @@ import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
+import com.starrocks.server.GlobalStateMgr;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import org.apache.logging.log4j.LogManager;
@@ -69,10 +82,10 @@ public class ShowDataAction extends RestBaseAction {
     @Override
     public void execute(BaseRequest request, BaseResponse response) {
         String dbName = request.getSingleParameter("db");
-        ConcurrentHashMap<String, Database> fullNameToDb = Catalog.getCurrentCatalog().getFullNameToDb();
+        ConcurrentHashMap<String, Database> fullNameToDb = GlobalStateMgr.getCurrentState().getFullNameToDb();
         long totalSize = 0;
         if (dbName != null) {
-            Database db = fullNameToDb.get("default_cluster:" + dbName);
+            Database db = fullNameToDb.get(dbName);
             if (db == null) {
                 response.getContent().append("database " + dbName + " not found.");
                 sendResult(request, response, HttpResponseStatus.NOT_FOUND);
@@ -81,7 +94,7 @@ public class ShowDataAction extends RestBaseAction {
             totalSize = getDataSizeOfDatabase(db);
         } else {
             for (Database db : fullNameToDb.values()) {
-                LOG.info("database name: {}", db.getFullName());
+                LOG.info("database name: {}", db.getOriginName());
                 totalSize += getDataSizeOfDatabase(db);
             }
         }

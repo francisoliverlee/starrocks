@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Table.java
 
@@ -25,11 +38,17 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.CreateTableStmt;
+import com.google.common.collect.Sets;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.DescriptorTable.ReferencedPartitionInfo;
 import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.lake.LakeMaterializedView;
+import com.starrocks.lake.LakeTable;
+import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.CreateTableStmt;
 import com.starrocks.thrift.TTableDescriptor;
 import org.apache.commons.lang.NotImplementedException;
 import org.apache.logging.log4j.LogManager;
@@ -39,33 +58,56 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import javax.annotation.Nullable;
 
 /**
  * Internal representation of table-related metadata. A table contains several partitions.
  */
-public class Table extends MetaObject implements Writable {
+public class Table extends MetaObject implements Writable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(Table.class);
 
+    // 1. Native table:
+    //   1.1 Local: OLAP, MATERIALIZED_VIEW
+    //   1.2 Cloud native: LAKE, LAKE_MATERIALIZED_VIEW
+    // 2. System table: SCHEMA
+    // 3. View: INLINE_VIEW, VIEW
+    // 4. External table: MYSQL, OLAP_EXTERNAL, BROKER, ELASTICSEARCH, HIVE, ICEBERG, HUDI, ODBC, JDBC
     public enum TableType {
         MYSQL,
         OLAP,
+        OLAP_EXTERNAL,
         SCHEMA,
         INLINE_VIEW,
         VIEW,
         BROKER,
         ELASTICSEARCH,
         HIVE,
-        ODBC
+        ICEBERG,
+        HUDI,
+        JDBC,
+        MATERIALIZED_VIEW,
+        LAKE,
+        DELTALAKE,
+        FILE,
+        LAKE_MATERIALIZED_VIEW
     }
 
+    @SerializedName(value = "id")
     protected long id;
+    @SerializedName(value = "name")
     protected String name;
+    @SerializedName(value = "type")
     protected TableType type;
+    @SerializedName(value = "createTime")
     protected long createTime;
     /*
-     *  fullSchema and nameToColumn should contains all columns, both visible and shadow.
+     *  fullSchema and nameToColumn should contain all columns, both visible and shadow.
      *  eg. for OlapTable, when doing schema change, there will be some shadow columns which are not visible
      *      to query but visible to load process.
      *  If you want to get all visible columns, you should call getBaseSchema() method, which is override in
@@ -84,6 +126,7 @@ public class Table extends MetaObject implements Writable {
      * <p>
      * If you want to get the mv columns, you should call getIndexToSchema in Subclass OlapTable.
      */
+    @SerializedName(value = "fullSchema")
     protected List<Column> fullSchema;
     // tree map for case-insensitive lookup.
     /**
@@ -94,19 +137,26 @@ public class Table extends MetaObject implements Writable {
     // DO NOT persist this variable.
     protected boolean isTypeRead = false;
     // table(view)'s comment
+    @SerializedName(value = "comment")
     protected String comment = "";
+
+    // not serialized field
+    // record all materialized views based on this Table
+    @SerializedName(value = "mvs")
+    protected Set<MvId> relatedMaterializedViews;
 
     public Table(TableType type) {
         this.type = type;
         this.fullSchema = Lists.newArrayList();
         this.nameToColumn = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
+        this.relatedMaterializedViews = Sets.newConcurrentHashSet();
     }
 
     public Table(long id, String tableName, TableType type, List<Column> fullSchema) {
         this.id = id;
         this.name = tableName;
         this.type = type;
-        // must copy the list, it should not be the same object as in indexIdToSchmea
+        // must copy the list, it should not be the same object as in indexIdToSchema
         if (fullSchema != null) {
             this.fullSchema = Lists.newArrayList(fullSchema);
         }
@@ -120,10 +170,7 @@ public class Table extends MetaObject implements Writable {
             Preconditions.checkArgument(type == TableType.VIEW, "Table has no columns");
         }
         this.createTime = Instant.now().getEpochSecond();
-    }
-
-    public boolean isTypeRead() {
-        return isTypeRead;
+        this.relatedMaterializedViews = Sets.newConcurrentHashSet();
     }
 
     public void setTypeRead(boolean isTypeRead) {
@@ -134,12 +181,88 @@ public class Table extends MetaObject implements Writable {
         return id;
     }
 
+    /**
+     * Get the unique id of table in string format, since we already ensure
+     * the uniqueness of id for internal table, we just convert it to string
+     * and return, for external table it's up to the implementation of connector.
+     *
+     * @return unique id of table in string format
+     */
+    public String getUUID() {
+        return Long.toString(id);
+    }
+
+    public void setId(long id) {
+        this.id = id;
+    }
+
     public String getName() {
         return name;
     }
 
+    public String getTableIdentifier() {
+        return name;
+    }
+
+    public void setType(TableType type) {
+        this.type = type;
+    }
+
     public TableType getType() {
         return type;
+    }
+
+    public boolean isOlapTable() {
+        return type == TableType.OLAP;
+    }
+
+    public boolean isOlapMaterializedView() {
+        return type == TableType.MATERIALIZED_VIEW;
+    }
+
+    public boolean isLocalTable() {
+        return isOlapTable() || isOlapMaterializedView();
+    }
+
+    public boolean isLakeTable() {
+        return type == TableType.LAKE;
+    }
+
+    public boolean isLakeMaterializedView() {
+        return type == TableType.LAKE_MATERIALIZED_VIEW;
+    }
+
+    public boolean isCloudNativeTable() {
+        return isLakeTable() || isLakeMaterializedView();
+    }
+
+    public boolean isMaterializedView() {
+        return isOlapMaterializedView() || isLakeMaterializedView();
+    }
+
+    public boolean isNativeTable() {
+        return isLocalTable() || isCloudNativeTable();
+    }
+
+    public boolean isHiveTable() {
+        return type == TableType.HIVE;
+    }
+
+    public boolean isHudiTable() {
+        return type == TableType.HUDI;
+    }
+
+    public boolean isIcebergTable() {
+        return type == TableType.ICEBERG;
+    }
+
+    public boolean isDeltalakeTable() {
+        return type == TableType.DELTALAKE;
+    }
+
+    // for create table
+    public boolean isOlapOrLakeTable() {
+        return isOlapTable() || isLakeTable();
     }
 
     public List<Column> getFullSchema() {
@@ -161,6 +284,14 @@ public class Table extends MetaObject implements Writable {
 
     public Column getColumn(String name) {
         return nameToColumn.get(name);
+    }
+
+    public boolean containColumn(String columnName) {
+        return nameToColumn.containsKey(columnName);
+    }
+
+    public List<Column> getColumns() {
+        return new ArrayList<>(nameToColumn.values());
     }
 
     public long getCreateTime() {
@@ -186,8 +317,28 @@ public class Table extends MetaObject implements Writable {
             table = new EsTable();
         } else if (type == TableType.HIVE) {
             table = new HiveTable();
-        } else if (type == TableType.ODBC) {
-            table = new OdbcTable();
+        } else if (type == TableType.FILE) {
+            table = new FileTable();
+        } else if (type == TableType.HUDI) {
+            table = new HudiTable();
+        } else if (type == TableType.OLAP_EXTERNAL) {
+            table = new ExternalOlapTable();
+        } else if (type == TableType.ICEBERG) {
+            table = new IcebergTable();
+        } else if (type == TableType.JDBC) {
+            table = new JDBCTable();
+        } else if (type == TableType.MATERIALIZED_VIEW) {
+            table = MaterializedView.read(in);
+            table.setTypeRead(true);
+            return table;
+        } else if (type == TableType.LAKE) {
+            table = LakeTable.read(in);
+            table.setTypeRead(true);
+            return table;
+        } else if (type == TableType.LAKE_MATERIALIZED_VIEW) {
+            table = LakeMaterializedView.read(in);
+            table.setTypeRead(true);
+            return table;
         } else {
             throw new IOException("Unknown table type: " + type.name());
         }
@@ -240,22 +391,37 @@ public class Table extends MetaObject implements Writable {
             this.nameToColumn.put(column.getName(), column);
         }
 
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_63) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_63) {
             comment = Text.readString(in);
         } else {
             comment = "";
         }
 
         // read create time
-        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_64) {
+        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_64) {
             this.createTime = in.readLong();
         } else {
             this.createTime = -1L;
         }
     }
 
-    public boolean equals(Table table) {
-        return true;
+    @Override
+    public void gsonPostProcess() throws IOException {
+        relatedMaterializedViews = Sets.newConcurrentHashSet();
+    }
+
+    @Override
+    public int hashCode() {
+        return Long.hashCode(id);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (!(other instanceof Table)) {
+            return false;
+        }
+        Table otherTable = (Table) other;
+        return id == otherTable.id;
     }
 
     // return if this table is partitioned.
@@ -268,6 +434,18 @@ public class Table extends MetaObject implements Writable {
         return null;
     }
 
+    public Partition getPartition(long partitionId) {
+        return null;
+    }
+
+    public Collection<Partition> getPartitions() {
+        return Collections.emptyList();
+    }
+
+    public Set<String> getDistributionColumnNames() {
+        return Collections.emptySet();
+    }
+
     public String getEngine() {
         if (this instanceof OlapTable) {
             return "StarRocks";
@@ -275,16 +453,38 @@ public class Table extends MetaObject implements Writable {
             return "MySQL";
         } else if (this instanceof SchemaTable) {
             return "MEMORY";
+        } else if (this instanceof HiveTable) {
+            return "Hive";
+        } else if (this instanceof HudiTable) {
+            return "Hudi";
+        } else if (this instanceof IcebergTable) {
+            return "Iceberg";
+        } else if (this instanceof DeltaLakeTable) {
+            return "DeltaLake";
+        } else if (this instanceof EsTable) {
+            return "Elasticsearch";
+        } else if (this instanceof JDBCTable) {
+            return "JDBC";
+        } else if (this instanceof FileTable) {
+            return "File";
         } else {
             return null;
         }
     }
 
     public String getMysqlType() {
-        if (this instanceof View) {
-            return "VIEW";
+        switch (type) {
+            case INLINE_VIEW:
+            case VIEW:
+            case MATERIALIZED_VIEW:
+            case LAKE_MATERIALIZED_VIEW:
+                return "VIEW";
+            case SCHEMA:
+                return "SYSTEM VIEW";
+            default:
+                // external table also returns "BASE TABLE" for BI compatibility
+                return "BASE TABLE";
         }
-        return "BASE TABLE";
     }
 
     public String getComment() {
@@ -314,32 +514,115 @@ public class Table extends MetaObject implements Writable {
 
     /*
      * 1. Only schedule OLAP table.
-     * 2. If table is colocate with other table, not schedule it.
+     * 2. If table is colocate with other table,
+     *   2.1 If is clone between bes or group is not stable, table can not be scheduled.
+     *   2.2 If is local balance and group is stable, table can be scheduled.
      * 3. (deprecated). if table's state is ROLLUP or SCHEMA_CHANGE, but alter job's state is FINISHING, we should also
      *      schedule the tablet to repair it(only for VERSION_IMCOMPLETE case, this will be checked in
      *      TabletScheduler).
      * 4. Even if table's state is ROLLUP or SCHEMA_CHANGE, check it. Because we can repair the tablet of base index.
+     * 5. PRIMARY_KEYS table does not support local balance.
      */
-    public boolean needSchedule() {
-        if (type != TableType.OLAP) {
+    public boolean needSchedule(boolean isLocalBalance) {
+        if (!isLocalTable()) {
             return false;
         }
 
-        OlapTable olapTable = (OlapTable) this;
+        ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentColocateIndex();
+        if (colocateIndex.isColocateTable(getId())) {
+            boolean isGroupUnstable = colocateIndex.isGroupUnstable(colocateIndex.getGroup(getId()));
+            if (!isLocalBalance || isGroupUnstable) {
+                LOG.debug(
+                        "table {} is a colocate table, skip tablet checker. is local migration: {}, is group unstable: {}",
+                        name, isLocalBalance, isGroupUnstable);
+                return false;
+            }
+        }
 
-        if (Catalog.getCurrentColocateIndex().isColocateTable(olapTable.getId())) {
-            LOG.debug("table {} is a colocate table, skip tablet checker.", name);
+        OlapTable olapTable = (OlapTable) this;
+        if (isLocalBalance && olapTable.getKeysType() == KeysType.PRIMARY_KEYS) {
             return false;
         }
 
         return true;
     }
 
-    // onCreate is called when this table is created
-    public void onCreate() {
+    public boolean hasAutoIncrementColumn() {
+        List<Column> columns = this.getFullSchema();
+        for (Column col : columns) {
+            if (col.isAutoIncrement()) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    // onDrop is called when this table is dropped
-    public void onDrop() {
+    /**
+     * onCreate is called when this table is created
+     */
+    public void onCreate() {
+        // Do nothing by default.
+    }
+
+    /**
+     * This method is called right before the calling of {@link Database#dropTable(String)}, with the protection of the
+     * database's writer lock.
+     * <p>
+     * If {@code force} is false, this table will be placed into the {@link CatalogRecycleBin} and may be
+     * recovered later, so the implementation should not delete any real data otherwise there will be
+     * data loss after the table been recovered.
+     *
+     * @param db     the owner database of the table
+     * @param force  is this a force drop
+     * @param replay is this is a log replay operation
+     */
+    public void onDrop(Database db, boolean force, boolean replay) {
+        // Do nothing by default.
+    }
+
+    /**
+     * Delete this table. this method is called with the protection of the database's writer lock.
+     *
+     * @param replay is this a log replay operation.
+     * @return a {@link Runnable} object that will be invoked after the table has been deleted from
+     * catalog, or null if no action need to be performed.
+     */
+    @Nullable
+    public Runnable delete(boolean replay) {
+        return null;
+    }
+
+    public boolean isSupported() {
+        return false;
+    }
+
+    public Map<String, String> getProperties() {
+        throw new NotImplementedException();
+    }
+
+    // should call this when create materialized view
+    public void addRelatedMaterializedView(MvId mvId) {
+        relatedMaterializedViews.add(mvId);
+    }
+
+    // should call this when drop materialized view
+    public void removeRelatedMaterializedView(MvId mvId) {
+        relatedMaterializedViews.remove(mvId);
+    }
+
+    public Set<MvId> getRelatedMaterializedViews() {
+        return relatedMaterializedViews;
+    }
+
+    public boolean isUnPartitioned() {
+        return true;
+    }
+
+    public List<String> getPartitionColumnNames() {
+        return Lists.newArrayList();
+    }
+
+    public boolean supportsUpdate() {
+        return false;
     }
 }

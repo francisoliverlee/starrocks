@@ -1,57 +1,55 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/test/olap/primary_key_encoder_test.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/primary_key_encoder.h"
 
 #include <gtest/gtest.h>
 
+#include <memory>
+
 #include "column/chunk.h"
 #include "column/datum.h"
 #include "column/schema.h"
-#include "storage/vectorized/chunk_helper.h"
+#include "gutil/stringprintf.h"
+#include "storage/chunk_helper.h"
 
 using namespace std;
 
 namespace starrocks {
 
-static unique_ptr<vectorized::Schema> create_key_schema(const vector<FieldType>& types) {
-    vectorized::Fields fields;
+static unique_ptr<Schema> create_key_schema(const vector<LogicalType>& types) {
+    Fields fields;
+    std::vector<ColumnId> sort_key_idxes(types.size());
     for (int i = 0; i < types.size(); i++) {
         string name = StringPrintf("col%d", i);
-        auto fd = new vectorized::Field(i, name, types[i], false);
+        auto fd = new Field(i, name, types[i], false);
         fd->set_is_key(true);
-        fd->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
+        fd->set_aggregate_method(STORAGE_AGGREGATE_NONE);
         fields.emplace_back(fd);
+        sort_key_idxes[i] = i;
     }
-    return unique_ptr<vectorized::Schema>(new vectorized::Schema(std::move(fields)));
+    return std::make_unique<Schema>(std::move(fields), PRIMARY_KEYS, sort_key_idxes);
 }
 
 TEST(PrimaryKeyEncoderTest, testEncodeInt32) {
-    auto sc = create_key_schema({OLAP_FIELD_TYPE_INT});
-    unique_ptr<vectorized::Column> dest;
+    auto sc = create_key_schema({TYPE_INT});
+    unique_ptr<Column> dest;
     PrimaryKeyEncoder::create_column(*sc, &dest);
     const int n = 1000;
-    auto pchunk = vectorized::ChunkHelper::new_chunk(*sc, n);
+    auto pchunk = ChunkHelper::new_chunk(*sc, n);
     for (int i = 0; i < n; i++) {
-        vectorized::Datum tmp;
+        Datum tmp;
         tmp.set_int32(i * 2343);
         pchunk->columns()[0]->append_datum(tmp);
     }
@@ -66,13 +64,13 @@ TEST(PrimaryKeyEncoderTest, testEncodeInt32) {
 }
 
 TEST(PrimaryKeyEncoderTest, testEncodeInt128) {
-    auto sc = create_key_schema({OLAP_FIELD_TYPE_LARGEINT});
-    unique_ptr<vectorized::Column> dest;
+    auto sc = create_key_schema({TYPE_LARGEINT});
+    unique_ptr<Column> dest;
     PrimaryKeyEncoder::create_column(*sc, &dest);
     const int n = 1000;
-    auto pchunk = vectorized::ChunkHelper::new_chunk(*sc, n);
+    auto pchunk = ChunkHelper::new_chunk(*sc, n);
     for (int i = 0; i < n; i++) {
-        vectorized::Datum tmp;
+        Datum tmp;
         tmp.set_int128(i * 2343);
         pchunk->columns()[0]->append_datum(tmp);
     }
@@ -91,14 +89,13 @@ TEST(PrimaryKeyEncoderTest, testEncodeInt128) {
 }
 
 TEST(PrimaryKeyEncoderTest, testEncodeComposite) {
-    auto sc = create_key_schema(
-            {OLAP_FIELD_TYPE_INT, OLAP_FIELD_TYPE_VARCHAR, OLAP_FIELD_TYPE_SMALLINT, OLAP_FIELD_TYPE_BOOL});
-    unique_ptr<vectorized::Column> dest;
+    auto sc = create_key_schema({TYPE_INT, TYPE_VARCHAR, TYPE_SMALLINT, TYPE_BOOLEAN});
+    unique_ptr<Column> dest;
     PrimaryKeyEncoder::create_column(*sc, &dest);
     const int n = 1;
-    auto pchunk = vectorized::ChunkHelper::new_chunk(*sc, n);
+    auto pchunk = ChunkHelper::new_chunk(*sc, n);
     for (int i = 0; i < n; i++) {
-        vectorized::Datum tmp;
+        Datum tmp;
         tmp.set_int32(i * 2343);
         pchunk->columns()[0]->append_datum(tmp);
         string tmpstr = StringPrintf("slice000%d", i * 17);
@@ -135,11 +132,10 @@ TEST(PrimaryKeyEncoderTest, testEncodeComposite) {
 
 TEST(PrimaryKeyEncoderTest, testEncodeCompositeLimit) {
     {
-        auto sc = create_key_schema(
-                {OLAP_FIELD_TYPE_INT, OLAP_FIELD_TYPE_VARCHAR, OLAP_FIELD_TYPE_SMALLINT, OLAP_FIELD_TYPE_BOOL});
+        auto sc = create_key_schema({TYPE_INT, TYPE_VARCHAR, TYPE_SMALLINT, TYPE_BOOLEAN});
         const int n = 1;
-        auto pchunk = vectorized::ChunkHelper::new_chunk(*sc, n);
-        vectorized::Datum tmp;
+        auto pchunk = ChunkHelper::new_chunk(*sc, n);
+        Datum tmp;
         tmp.set_int32(42);
         pchunk->columns()[0]->append_datum(tmp);
         string tmpstr("slice0000");
@@ -155,11 +151,10 @@ TEST(PrimaryKeyEncoderTest, testEncodeCompositeLimit) {
     }
 
     {
-        auto sc = create_key_schema(
-                {OLAP_FIELD_TYPE_INT, OLAP_FIELD_TYPE_VARCHAR, OLAP_FIELD_TYPE_SMALLINT, OLAP_FIELD_TYPE_BOOL});
+        auto sc = create_key_schema({TYPE_INT, TYPE_VARCHAR, TYPE_SMALLINT, TYPE_BOOLEAN});
         const int n = 1;
-        auto pchunk = vectorized::ChunkHelper::new_chunk(*sc, n);
-        vectorized::Datum tmp;
+        auto pchunk = ChunkHelper::new_chunk(*sc, n);
+        Datum tmp;
         tmp.set_int32(42);
         pchunk->columns()[0]->append_datum(tmp);
         string tmpstr(128, 's');

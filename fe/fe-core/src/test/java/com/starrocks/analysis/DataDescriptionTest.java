@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/DataDescriptionTest.java
 
@@ -23,31 +36,45 @@ package com.starrocks.analysis;
 
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BinaryPredicate.Operator;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.MockedAuth;
-import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.ColumnSeparator;
+import com.starrocks.sql.ast.DataDescription;
+import com.starrocks.sql.ast.PartitionNames;
+import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.utframe.StarRocksAssert;
+import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
 import mockit.Injectable;
-import mockit.Mocked;
 import org.junit.Assert;
-import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 public class DataDescriptionTest {
+    private static StarRocksAssert starRocksAssert;
 
-    @Mocked
-    private Auth auth;
-    @Mocked
-    private ConnectContext ctx;
+    @BeforeClass
+    public static void beforeClass() throws Exception {
+        UtFrameUtils.createMinStarRocksCluster();
+        UtFrameUtils.addMockBackend(10002);
+        UtFrameUtils.addMockBackend(10003);
+        starRocksAssert = new StarRocksAssert(UtFrameUtils.initCtxForNewPrivilege(UserIdentity.ROOT));
+        starRocksAssert.withDatabase("testDb");
+        List<String> tables = Arrays.asList("testTable", "testHiveTable");
+        String sql = "create table testDb.%s (k1 varchar(32), k2 varchar(32), k3 varchar(32), k4 int) " +
+                "AGGREGATE KEY(k1, k2, k3, k4) distributed by hash(k1) buckets 3 properties('replication_num' = '1');";
 
-    @Before
-    public void setUp() {
-        MockedAuth.mockedAuth(auth);
-        MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        tables.forEach(t -> {
+            try {
+                starRocksAssert.withTable(String.format(sql, t));
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
     }
 
     @Test
@@ -106,7 +133,7 @@ public class DataDescriptionTest {
         params.add(new StringLiteral("day"));
         params.add(new SlotRef(null, "k2"));
         BinaryPredicate predicate = new BinaryPredicate(Operator.EQ, new SlotRef(null, "k1"),
-                new FunctionCallExpr("alignment_timestamp", params));
+                new FunctionCallExpr(FunctionSet.ALIGNMENT_TIMESTAMP, params));
         desc = new DataDescription("testTable", new PartitionNames(false, Lists.newArrayList("p1", "p2")),
                 Lists.newArrayList("abc.txt"),
                 Lists.newArrayList("k2", "k3"), null, null, null, false,
@@ -121,7 +148,7 @@ public class DataDescriptionTest {
         params.add(new StringLiteral("-"));
         params.add(new StringLiteral("10"));
         predicate = new BinaryPredicate(Operator.EQ, new SlotRef(null, "k1"),
-                new FunctionCallExpr("replace_value", params));
+                new FunctionCallExpr(FunctionSet.REPLACE_VALUE, params));
         desc = new DataDescription("testTable", new PartitionNames(false, Lists.newArrayList("p1", "p2")),
                 Lists.newArrayList("abc.txt"),
                 Lists.newArrayList("k2", "k3"), null, null, null,
@@ -136,7 +163,7 @@ public class DataDescriptionTest {
         params.add(new StringLiteral(""));
         params.add(new NullLiteral());
         predicate = new BinaryPredicate(Operator.EQ, new SlotRef(null, "k1"),
-                new FunctionCallExpr("replace_value", params));
+                new FunctionCallExpr(FunctionSet.REPLACE_VALUE, params));
         desc = new DataDescription("testTable", new PartitionNames(false, Lists.newArrayList("p1", "p2")),
                 Lists.newArrayList("abc.txt"),
                 Lists.newArrayList("k2", "k3"), null, null, null, false,
@@ -155,7 +182,7 @@ public class DataDescriptionTest {
                 "testHiveTable", false, Lists.newArrayList(predicate), null);
         desc.analyze("testDb");
         sql = "DATA FROM TABLE testHiveTable INTO TABLE testTable PARTITIONS (p1, p2) SET (`k1` = bitmap_dict(`k2`))";
-        Assert.assertEquals(sql, desc.toSql());
+        Assert.assertEquals(sql, desc.toString());
     }
 
     @Test(expected = AnalysisException.class)

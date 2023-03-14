@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/action/QueryProfileAction.java
 
@@ -51,6 +64,7 @@ public class QueryProfileAction extends WebBaseAction {
 
         String queryProfileStr = ProfileManager.getInstance().getProfile(queryId);
         if (queryProfileStr != null) {
+            appendCopyButton(response.getContent());
             appendQueryProfile(response.getContent(), queryProfileStr);
             getPageFooter(response.getContent());
             writeResponse(request, response);
@@ -62,9 +76,24 @@ public class QueryProfileAction extends WebBaseAction {
     }
 
     private void appendQueryProfile(StringBuilder buffer, String queryProfileStr) {
-        buffer.append("<pre>");
+        buffer.append("<pre id='profile'>");
         buffer.append(queryProfileStr);
         buffer.append("</pre>");
     }
 
+    private void appendCopyButton(StringBuilder buffer) {
+        buffer.append("<script type=\"text/javascript\">\n" +
+                "function copyProfile(){\n" +
+                "  v = $('#profile').html()\n" +
+                "  const t = document.createElement('textarea')\n" +
+                "  t.style.cssText = 'position: absolute;top:0;left:0;opacity:0'\n" +
+                "  document.body.appendChild(t)\n" +
+                "  t.value = v\n" +
+                "  t.select()\n" +
+                "  document.execCommand('copy')\n" +
+                "  document.body.removeChild(t)\n" +
+                "}\n" +
+                "</script>");
+        buffer.append("<input type=\"button\" onclick=\"copyProfile();\" value=\"Copy Profile\"></input>");
+    }
 }
